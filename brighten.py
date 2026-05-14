@@ -51,16 +51,6 @@ def rewrite_ram_geps(module: Module, ram: Value) -> int:
     return len(geps)
 
 
-def define_ret_stub(module: Module):
-    """Make the modeled return hook removable for this demo wrapper."""
-    ret_handler = module.get_function("__striga_ret")
-    if ret_handler is not None and ret_handler.is_declaration:
-        ret_handler.linkage = Linkage.Internal
-        entry = ret_handler.append_basic_block("entry")
-        with entry.create_builder() as ir:
-            ir.ret_void()
-
-
 with global_context().create_module("blog") as module:
     start = 0x1000
     sem = lift_bfs(module, CODE, start, verbose=False)
@@ -68,6 +58,11 @@ with global_context().create_module("blog") as module:
     # Optimize lifted function for readablity (not strictly necessary)
     sem.function.optimize("instcombine,simplifycfg,early-cse<memssa>,dse,adce")
     print(sem.function)
+
+    # Implement __striga_ret
+    sem.ret_handler.linkage = Linkage.Internal
+    with sem.ret_handler.create_builder() as ir:
+        ir.ret_void()
 
     # Convenience aliases
     types = module.context.types
@@ -112,12 +107,6 @@ with global_context().create_module("blog") as module:
     # 2. Brighten lifted memory: @RAM + integer address -> inttoptr(address).
     rewrite_ram_geps(module, ram)
 
-    # 3. Now that RAM accesses have been brightened, discard the modeled ret
-    #    hook for this demo and let LLVM clean up the remaining wrapper noise.
-    #    Undefined flag helpers are already declared memory(none) by Semantics,
-    #    so their dead uses fold away without local stub definitions.
-    define_ret_stub(module)
-    module.verify_or_raise()
     module.optimize(OPT_PIPELINE)
 
     print(module)
