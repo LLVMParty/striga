@@ -194,6 +194,7 @@ class Semantics:
         fn = self.module.get_function(name)
         if fn is None:
             fn = self.module.add_function(name, self.lifted_ty)
+            fn.attributes.add("alwaysinline")
             fn.param_attributes(0).add("noalias")
             fn.param_attributes(1).add("noalias")
             state, memory = fn.params

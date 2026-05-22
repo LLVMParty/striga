@@ -1,7 +1,7 @@
 from llvm import Linkage, Module, Opcode, Value, global_context
 
 from bfs import lift_bfs
-from container import Container, RawContainer
+from container import Container, PEContainer, RawContainer
 
 OPT_PIPELINE = "default<O1>"
 
@@ -61,6 +61,7 @@ def lift_brightened(container: Container, entry: int, args: list[str]):
 
         # Global RAM array
         ram = module.add_global(types.array(i8, 0), "RAM")
+        ram.alignment = 1
 
         # TODO: support different register sizes
         brightened_ty = types.function(i64, [i64 for _ in args])
@@ -74,6 +75,15 @@ def lift_brightened(container: Container, entry: int, args: list[str]):
             # Assign arguments to register state
             for i, name in enumerate(args):
                 ir.store(brightened.get_param(i), reg_ptr(name))
+
+            # Set up gsbase
+            teb = ir.alloca(i8, i64.constant(4096), "teb")
+            ir.store(ir.ptrtoint(teb, i64), reg_ptr("gsbase"))
+            peb_ptr = ir.gep(i8, teb, [i64.constant(0x60)], "peb_ptr")
+            peb = ir.alloca(i8, i64.constant(4096), "peb")
+            ir.store(peb, peb_ptr)
+            imagebase_ptr = ir.gep(i8, peb, [i64.constant(0x10)], "imagebase_ptr")
+            ir.store(i64.constant(container.image_base), imagebase_ptr)
 
             # Set up function stack
             stack = ir.alloca(i8, i64.constant(4096), "stack")
@@ -92,8 +102,12 @@ def lift_brightened(container: Container, entry: int, args: list[str]):
 
         module.verify_or_raise()
 
+        print(module)
+
         # 1. Inline/optimize with @RAM assigned to the lifted memory parameter.
         module.optimize(OPT_PIPELINE)
+
+        print(module)
 
         # 2. Brighten lifted memory: @RAM + integer address -> inttoptr(address).
         rewrite_ram_geps(module, ram)
@@ -108,22 +122,6 @@ def lift_brightened(container: Container, entry: int, args: list[str]):
 
         print(brightened)
 
+pe = PEContainer("tests/binaryshield.exe")
 
-# add
-lift_brightened(
-    RawContainer(bytes.fromhex("48 01 F7 48 89 F8 C3"), 0x1000), 0x1000, ["rdi", "rsi"]
-)
-
-# lift4
-lift_brightened(
-    RawContainer(bytes.fromhex("b8 39 05 00 00 48 33 07 c3"), 0x1000),
-    0x1000,
-    ["rdi"],
-)
-
-# lift6
-lift_brightened(
-    RawContainer(bytes.fromhex("55 48 89 e5 48 89 7d f8 48 8b 45 f8 5d c3"), 0x1000),
-    0x1000,
-    ["rdi"],
-)
+lift_brightened(pe, 0x140017A41, ["rax", "rbx", "rcx", "rdx", "rbp", "rsp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"])

@@ -1,10 +1,10 @@
-from llvm import create_context, Module, Function
+from llvm import create_context, Module
 from container import PEContainer
 from bfs import lift_bfs
 
 
-def lift_pe(module: Module, filename: str, start: int, *, verbose=False) -> Function:
-    return lift_bfs(module, PEContainer(filename), start, verbose=verbose).function
+def lift_pe(module: Module, filename: str, start: int, *, verbose=False):
+    return lift_bfs(module, PEContainer(filename), start, verbose=verbose)
 
 
 if __name__ == "__main__":
