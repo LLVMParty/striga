@@ -539,6 +539,7 @@ def rewrite_writable_image_memory(
     tracer: HandlerTracer,
     seeds: list[Seed],
     overlay: WritableImageOverlay,
+    initial_values: dict[int, int],
 ) -> int:
     sections = writable_image_sections(tracer.container)
     if not sections:
@@ -567,21 +568,25 @@ def rewrite_writable_image_memory(
                 continue
             overlay_alloca = get_or_create_overlay_alloca(function, section)
             slot = (section.name, addr, size)
-            if slot not in overlay.initialized_slots:
-                data = tracer.container.get_data(addr, size)
-                value = int.from_bytes(data, "little")
+            if inst.opcode == Opcode.Load and slot not in overlay.initialized_slots:
+                if size == 8 and addr in initial_values:
+                    value = initial_values[addr]
+                    detail_prefix = "initial override writable image"
+                else:
+                    data = tracer.container.get_data(addr, size)
+                    value = int.from_bytes(data, "little")
+                    detail_prefix = "initial writable image"
                 insert_overlay_initializer(function, overlay_alloca, section, addr, size, value)
-                if inst.opcode == Opcode.Load:
-                    load_insn = instruction_address_from_metadata(inst) or 0
-                    addr_expr = evaluator.eval_value(offset_value).with_width(64).text
-                    seeds.append(
-                        Seed(
-                            "image_load",
-                            load_insn,
-                            value,
-                            f"initial writable image i{width} at {addr:#x}; addr_expr={addr_expr}",
-                        )
+                load_insn = instruction_address_from_metadata(inst) or 0
+                addr_expr = evaluator.eval_value(offset_value).with_width(64).text
+                seeds.append(
+                    Seed(
+                        "image_load",
+                        load_insn,
+                        value,
+                        f"{detail_prefix} i{width} at {addr:#x}; addr_expr={addr_expr}",
                     )
+                )
                 overlay.initialized_slots.add(slot)
             with inst.create_builder() as ir:
                 replacement = ir.gep(
@@ -710,7 +715,7 @@ def optimize_for_discovery(
         localized_writable = 0
         if cfg.localize_writable_image:
             localized_writable = rewrite_writable_image_memory(
-                wrapper, memory, tracer, seeds, writable_overlay
+                wrapper, memory, tracer, seeds, writable_overlay, cfg.mem64
             )
         new_stack_slots = set(rewrite_result.stack_stores) - snapshotted_stack_slots
         stack_snapshot_sinks += insert_stack_snapshots(wrapper, env, new_stack_slots)
