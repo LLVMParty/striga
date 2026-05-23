@@ -149,6 +149,25 @@ def cqo(sem: Semantics):
 
 
 @semantic
+def bswap(sem: Semantics):
+    dst = sem.op_read(0)
+    width = dst.type.int_width
+    if width not in {32, 64}:
+        raise NotImplementedError(f"bswap width {width}")
+    result = dst.type.constant(0)
+    for i in range(width // 8):
+        byte = sem.ir.and_(
+            sem.ir.lshr(dst, dst.type.constant(i * 8)),
+            dst.type.constant(0xFF),
+        )
+        shift = width - 8 - i * 8
+        if shift:
+            byte = sem.ir.shl(byte, dst.type.constant(shift))
+        result = sem.ir.or_(result, byte)
+    sem.op_write(0, result)
+
+
+@semantic
 def xchg(sem: Semantics):
     src = sem.op_read(1)
     dst = sem.op_read(0)

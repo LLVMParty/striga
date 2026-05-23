@@ -1,7 +1,7 @@
 from llvm import Linkage, Module, Opcode, Value, global_context
 
 from bfs import lift_bfs
-from container import Container, PEContainer, RawContainer
+from container import Container, PEContainer
 
 OPT_PIPELINE = "default<O1>"
 
@@ -122,6 +122,28 @@ def lift_brightened(container: Container, entry: int, args: list[str]):
 
         print(brightened)
 
+
 pe = PEContainer("tests/binaryshield.exe")
 
-lift_brightened(pe, 0x140017A41, ["rax", "rbx", "rcx", "rdx", "rbp", "rsp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"])
+lift_brightened(
+    pe,
+    0x140017A41,
+    [
+        "rax",
+        "rbx",
+        "rcx",
+        "rdx",
+        "rbp",
+        "rsp",
+        "rsi",
+        "rdi",
+        "r8",
+        "r9",
+        "r10",
+        "r11",
+        "r12",
+        "r13",
+        "r14",
+        "r15",
+    ],
+)

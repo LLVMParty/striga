@@ -131,6 +131,26 @@ def neg(sem: Semantics):
 
 
 @semantic
+def adc(sem: Semantics):
+    dst = sem.op_read(0)
+    src = sem.resize_int(sem.op_read(1), dst.type)
+    carry = sem.ir.zext(sem.flag_read("cf"), dst.type)
+    src_plus_carry = sem.ir.add(src, carry)
+    result = sem.ir.add(dst, src_plus_carry)
+    sem.op_write(0, result)
+
+    wide_ty = sem.types.int_n(dst.type.int_width + 1)
+    wide_sum = sem.ir.add(
+        sem.ir.add(sem.ir.zext(dst, wide_ty), sem.ir.zext(src, wide_ty)),
+        sem.ir.zext(carry, wide_ty),
+    )
+    cf = sem.ir.trunc(sem.ir.lshr(wide_sum, wide_ty.constant(dst.type.int_width)), sem.i1)
+    sem.flag_write("cf", cf)
+    write_common_arith_flags(sem, dst, src_plus_carry, result)
+    sem.flag_write("of", add_overflow(sem, dst, src_plus_carry, result))
+
+
+@semantic
 def sbb(sem: Semantics):
     dst = sem.op_read(0)
     src = sem.resize_int(sem.op_read(1), dst.type)

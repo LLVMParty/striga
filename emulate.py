@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import icicle
 import pefile
@@ -66,7 +67,7 @@ class PEmulator:
         self.ic.mem_map(addr, size, protection)
         return addr
 
-    def map_image(self, pe: pefile.PE, *, image_base: int = 0):
+    def map_image(self, pe: pefile.PE, *, image_base: int = 0) -> int:
         assert pe.FILE_HEADER.Machine == self.pe.FILE_HEADER.Machine, (
             "Architecture mismatch"
         )
@@ -78,13 +79,14 @@ class PEmulator:
         )
 
         if image_base == 0:
-            image_base = pe.OPTIONAL_HEADER.ImageBase
+            image_base = cast(int, pe.OPTIONAL_HEADER.ImageBase)
 
         self.ic.mem_map(image_base, image_size, icicle.MemoryProtection.NoAccess)
         mapped_image = pe.get_memory_mapped_image(ImageBase=image_base)
         self.ic.mem_write(image_base, mapped_image)
 
-        for section in pe.sections:
+        sections = cast(list[Any], pe.sections)
+        for section in sections:
             name = section.Name.rstrip(b"\0")
             if section_alignment > 0:
                 mask = section_alignment - 1
@@ -114,7 +116,7 @@ class PEmulator:
                     f"Mapping section '{name.decode()}' {hex(rva)} -> {hex(va)} as {protect}"
                 )
 
-        header_size = pe.sections[0].VirtualAddress
+        header_size = cast(int, sections[0].VirtualAddress)
         self.ic.mem_protect(image_base, header_size, icicle.MemoryProtection.ReadOnly)
         return image_base
 

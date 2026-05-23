@@ -65,11 +65,17 @@ def main() -> None:
     missing_sections = sorted(REQUIRED_SECTIONS - parser.sections)
     assert not missing_sections, f"missing sections: {missing_sections}"
 
-    missing_links = sorted(f"#{section}" for section in REQUIRED_SECTIONS if f"#{section}" not in parser.links)
+    missing_links = sorted(
+        f"#{section}"
+        for section in REQUIRED_SECTIONS
+        if f"#{section}" not in parser.links
+    )
     assert not missing_links, f"missing toc links: {missing_links}"
 
     snippet_dir = ARTIFACTS / "snippets"
-    missing_snippets = sorted(name for name in REQUIRED_SNIPPETS if not (snippet_dir / name).exists())
+    missing_snippets = sorted(
+        name for name in REQUIRED_SNIPPETS if not (snippet_dir / name).exists()
+    )
     assert not missing_snippets, f"missing snippets: {missing_snippets}"
 
     required_terms = [
@@ -85,7 +91,9 @@ def main() -> None:
     for term in required_terms:
         assert term in html, f"missing term: {term}"
 
-    final_ir = (ARTIFACTS / "recovered" / "06-final-clean.ll").read_text(encoding="utf-8")
+    final_ir = (ARTIFACTS / "recovered" / "06-final-clean.ll").read_text(
+        encoding="utf-8"
+    )
     constants = {int(x) for x in re.findall(r"icmp eq i32 %x, (\d+)", final_ir)}
     assert constants == {1859, 2418, 1638, 299902, 29763}, constants
     for banned in ["@RAM", "__striga_", "switch ", "unresolved"]:

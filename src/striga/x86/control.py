@@ -399,5 +399,20 @@ def nop(sem: Semantics):
 
 
 @semantic
+def clc(sem: Semantics):
+    sem.flag_write("cf", sem.const_n(0, 1))
+
+
+@semantic
+def stc(sem: Semantics):
+    sem.flag_write("cf", sem.const_n(1, 1))
+
+
+@semantic
+def cmc(sem: Semantics):
+    sem.flag_write("cf", bool_not(sem, sem.flag_read("cf")))
+
+
+@semantic
 def pause(sem: Semantics):
     pass

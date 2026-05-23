@@ -345,8 +345,11 @@ class Semantics:
     def mem_read(self, addr: Value, ty: Type) -> Value:
         memory = self.function.get_param(1)
         ptr = self.ir.gep(self.i8, memory, [addr])
-        load = self.ir.load(ty, ptr)
+        load = self.ir.load(ty, ptr, f"mem_read_{self.insn.address:x}")
         load.inst_alignment = 1
+        load.metadata["striga.insn"] = self.context.md_node(
+            [self.context.md_string(hex(self.insn.address))]
+        )
         return load
 
     def mem_write(self, addr: Value, value: Value):
@@ -354,6 +357,9 @@ class Semantics:
         ptr = self.ir.gep(self.i8, memory, [addr])
         store = self.ir.store(value, ptr)
         store.inst_alignment = 1
+        store.metadata["striga.insn"] = self.context.md_node(
+            [self.context.md_string(hex(self.insn.address))]
+        )
 
     def op_mem(self, op: X86Op) -> Value:
         assert op.type == CS_OP_MEM

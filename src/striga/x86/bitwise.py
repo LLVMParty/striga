@@ -117,6 +117,11 @@ def shl(sem: Semantics):
     write_shl_flags(sem, dst, count, result)
 
 
+@semantic
+def sal(sem: Semantics):
+    shl(sem)
+
+
 def write_shr_flags(sem: Semantics, lhs: Value, count: Value, result: Value):
     width = lhs.type.int_width
     count_nonzero = sem.ir.icmp(IntPredicate.NE, count, count.type.constant(0))
@@ -191,6 +196,80 @@ def rol(sem: Semantics):
     sem.flag_write_if(count_nonzero, "of", of)
 
 
+@semantic
+def ror(sem: Semantics):
+    dst = sem.op_read(0)
+    width = dst.type.int_width
+    count = masked_shift_count(sem, sem.op_read(1), width)
+    rotate_count = sem.ir.urem(count, count.type.constant(width))
+    rotate_nonzero = sem.ir.icmp(
+        IntPredicate.NE, rotate_count, rotate_count.type.constant(0)
+    )
+    safe_count = sem.ir.select(rotate_nonzero, rotate_count, count.type.constant(1))
+
+    right = sem.ir.lshr(dst, safe_count)
+    left_count = sem.ir.sub(count.type.constant(width), safe_count)
+    left = sem.ir.shl(dst, left_count)
+    rotated = sem.ir.or_(left, right)
+    result = sem.ir.select(rotate_nonzero, rotated, dst)
+    sem.op_write(0, result)
+
+    count_nonzero = sem.ir.icmp(IntPredicate.NE, count, count.type.constant(0))
+    cf = sem.result_sign_bit(result)
+    sem.flag_write_if(count_nonzero, "cf", cf)
+
+    count_one = sem.ir.icmp(IntPredicate.EQ, count, count.type.constant(1))
+    second_msb = sem.ir.trunc(sem.ir.lshr(result, dst.type.constant(width - 2)), sem.i1)
+    of_for_one = sem.ir.xor(sem.result_sign_bit(result), second_msb)
+    of = sem.ir.select(count_one, of_for_one, sem.flag_undef("of"))
+    sem.flag_write_if(count_nonzero, "of", of)
+
+
+def rotate_through_carry(sem: Semantics, *, left: bool):
+    dst = sem.op_read(0)
+    width = dst.type.int_width
+    count = masked_shift_count(sem, sem.op_read(1), width)
+    ext_ty = sem.types.int_n(width + 1)
+    ring_width = ext_ty.constant(width + 1)
+    rotate_count = sem.ir.urem(sem.resize_int(count, ext_ty), ring_width)
+    rotate_nonzero = sem.ir.icmp(
+        IntPredicate.NE, rotate_count, rotate_count.type.constant(0)
+    )
+    safe_count = sem.ir.select(rotate_nonzero, rotate_count, rotate_count.type.constant(1))
+
+    carry = sem.ir.zext(sem.flag_read("cf"), ext_ty)
+    extended = sem.ir.or_(
+        sem.ir.zext(dst, ext_ty), sem.ir.shl(carry, ext_ty.constant(width))
+    )
+    if left:
+        first = sem.ir.shl(extended, safe_count)
+        second_count = sem.ir.sub(ring_width, safe_count)
+        second = sem.ir.lshr(extended, second_count)
+    else:
+        first = sem.ir.lshr(extended, safe_count)
+        second_count = sem.ir.sub(ring_width, safe_count)
+        second = sem.ir.shl(extended, second_count)
+    mask = ext_ty.constant(str((1 << (width + 1)) - 1), 10)
+    rotated = sem.ir.and_(sem.ir.or_(first, second), mask)
+    result = sem.ir.trunc(rotated, dst.type)
+    result = sem.ir.select(rotate_nonzero, result, dst)
+    sem.op_write(0, result)
+
+    new_cf = sem.ir.trunc(sem.ir.lshr(rotated, ext_ty.constant(width)), sem.i1)
+    sem.flag_write_if(rotate_nonzero, "cf", new_cf)
+    sem.flag_write_if(rotate_nonzero, "of", sem.flag_undef("of"))
+
+
+@semantic
+def rcl(sem: Semantics):
+    rotate_through_carry(sem, left=True)
+
+
+@semantic
+def rcr(sem: Semantics):
+    rotate_through_carry(sem, left=False)
+
+
 def write_sar_flags(sem: Semantics, lhs: Value, count: Value, result: Value):
     width = lhs.type.int_width
     count_nonzero = sem.ir.icmp(IntPredicate.NE, count, count.type.constant(0))
@@ -238,6 +317,54 @@ def sar(sem: Semantics):
 
     sem.op_write(0, result)
     write_sar_flags(sem, dst, count, result)
+
+
+@semantic
+def shrd(sem: Semantics):
+    dst = sem.op_read(0)
+    src = sem.resize_int(sem.op_read(1), dst.type)
+    width = dst.type.int_width
+    count = masked_shift_count(sem, sem.op_read(2), width)
+    count_nonzero = sem.ir.icmp(IntPredicate.NE, count, count.type.constant(0))
+    count_in_range = sem.ir.icmp(IntPredicate.ULT, count, count.type.constant(width))
+    active = sem.ir.and_(count_nonzero, count_in_range)
+    safe_count = sem.ir.select(active, count, count.type.constant(1))
+
+    right = sem.ir.lshr(dst, safe_count)
+    left_count = sem.ir.sub(count.type.constant(width), safe_count)
+    left = sem.ir.shl(src, left_count)
+    shifted = sem.ir.or_(right, left)
+    result = sem.ir.select(count_nonzero, shifted, dst)
+    sem.op_write(0, result)
+
+    cf_shift = sem.ir.sub(safe_count, count.type.constant(1))
+    cf = sem.ir.trunc(sem.ir.lshr(dst, cf_shift), sem.i1)
+    sem.flag_write_if(count_nonzero, "cf", cf)
+    sem.flag_write_undef_if(count_nonzero, "of")
+    sem.flag_write_if(count_nonzero, "pf", sem.result_parity_even(result))
+    sem.flag_write_undef_if(count_nonzero, "af")
+    sem.flag_write_if(count_nonzero, "zf", sem.result_is_zero(result))
+    sem.flag_write_if(count_nonzero, "sf", sem.result_sign_bit(result))
+
+
+@semantic
+def bsf(sem: Semantics):
+    dst = sem.op_read(0)
+    src = sem.resize_int(sem.op_read(1), dst.type)
+    width = src.type.int_width
+    zero = sem.ir.icmp(IntPredicate.EQ, src, src.type.constant(0))
+    result = dst.type.constant(0)
+    for bit in reversed(range(width)):
+        mask = src.type.constant(str(1 << bit), 10)
+        is_set = sem.ir.icmp(IntPredicate.NE, sem.ir.and_(src, mask), src.type.constant(0))
+        result = sem.ir.select(is_set, dst.type.constant(bit), result)
+    sem.op_write(0, sem.ir.select(zero, dst, result))
+    sem.flag_write("zf", zero)
+    sem.flag_write_undef("cf")
+    sem.flag_write_undef("pf")
+    sem.flag_write_undef("af")
+    sem.flag_write_undef("sf")
+    sem.flag_write_undef("of")
 
 
 def bit_test_base_and_mask(sem: Semantics) -> tuple[Value, Value, Value | None]:
@@ -308,6 +435,17 @@ def bt(sem: Semantics):
 def btr(sem: Semantics):
     base, mask, addr = bit_test_base_and_mask(sem)
     result = sem.ir.and_(base, sem.ir.not_(mask))
+    write_bit_test_flags(sem, base, mask)
+    if addr is None:
+        sem.op_write(0, result)
+    else:
+        sem.mem_write(addr, result)
+
+
+@semantic
+def btc(sem: Semantics):
+    base, mask, addr = bit_test_base_and_mask(sem)
+    result = sem.ir.xor(base, mask)
     write_bit_test_flags(sem, base, mask)
     if addr is None:
         sem.op_write(0, result)

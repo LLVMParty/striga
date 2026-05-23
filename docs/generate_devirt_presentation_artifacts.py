@@ -41,7 +41,9 @@ def stats_for(path: Path) -> IrStats:
         calls=len(re.findall(r"\bcall\b", text)),
         loads=len(re.findall(r"\bload\b", text)),
         stores=len(re.findall(r"\bstore\b", text)),
-        icmp_eq_constants=[int(x) for x in re.findall(r"icmp eq i32 %[-.$A-Za-z0-9_]+, (\d+)", text)],
+        icmp_eq_constants=[
+            int(x) for x in re.findall(r"icmp eq i32 %[-.$A-Za-z0-9_]+, (\d+)", text)
+        ],
     )
 
 
@@ -65,13 +67,19 @@ def write_snippet(name: str, content: str) -> Path:
 
 def main() -> None:
     resolver_first_built = ARTIFACT_DIR / "resolvers" / "140016000-01-built.ll"
-    resolver_first_inlined = ARTIFACT_DIR / "resolvers" / "140016000-02-inlined-before-hook-rewrite.ll"
-    resolver_first_hooked = ARTIFACT_DIR / "resolvers" / "140016000-03-hook-rewritten.ll"
+    resolver_first_inlined = (
+        ARTIFACT_DIR / "resolvers" / "140016000-02-inlined-before-hook-rewrite.ll"
+    )
+    resolver_first_hooked = (
+        ARTIFACT_DIR / "resolvers" / "140016000-03-hook-rewritten.ll"
+    )
     resolver_first_optimized = ARTIFACT_DIR / "resolvers" / "140016000-04-optimized.ll"
     resolver_jcc_optimized = ARTIFACT_DIR / "resolvers" / "14001676b-04-optimized.ll"
     recovered_skeleton = ARTIFACT_DIR / "recovered" / "01-skeleton-before-inline.ll"
     recovered_round8 = ARTIFACT_DIR / "recovered" / "04-cleanup-round-8.ll"
-    recovered_residual = ARTIFACT_DIR / "recovered" / "05-residual-before-final-pattern-cleanup.ll"
+    recovered_residual = (
+        ARTIFACT_DIR / "recovered" / "05-residual-before-final-pattern-cleanup.ll"
+    )
     recovered_final = ARTIFACT_DIR / "recovered" / "06-final-clean.ll"
 
     files = [
@@ -81,20 +89,49 @@ def main() -> None:
     stats = [stats_for(path) for path in files]
 
     snippets = {
-        "resolver-built-call.ll": window_around(read(resolver_first_built), r"call void @lifted_0x140016000", before=10, after=4),
-        "resolver-inlined-hook-call.ll": window_around(read(resolver_first_inlined), r"__striga_jmp", before=14, after=4),
-        "resolver-hook-rewritten-return.ll": window_around(read(resolver_first_hooked), r"insertvalue %TraceResult_140016000", before=8, after=20),
-        "resolver-optimized-target.ll": window_around(read(resolver_first_optimized), r"ret %TraceResult_140016000", before=24, after=3),
-        "jcc-resolver-select.ll": window_around(read(resolver_jcc_optimized), r"select i1", before=18, after=20),
-        "recovered-skeleton-switch.ll": window_around(read(recovered_skeleton), r"switch i64", before=4, after=12),
-        "recovered-round8-first-compare.ll": window_around(read(recovered_round8), r"icmp eq i32 %4, 1859", before=12, after=32),
-        "recovered-residual-membership.ll": window_around(read(recovered_residual), r"icmp eq i32 %4, 1859", before=12, after=72),
+        "resolver-built-call.ll": window_around(
+            read(resolver_first_built),
+            r"call void @lifted_0x140016000",
+            before=10,
+            after=4,
+        ),
+        "resolver-inlined-hook-call.ll": window_around(
+            read(resolver_first_inlined), r"__striga_jmp", before=14, after=4
+        ),
+        "resolver-hook-rewritten-return.ll": window_around(
+            read(resolver_first_hooked),
+            r"insertvalue %TraceResult_140016000",
+            before=8,
+            after=20,
+        ),
+        "resolver-optimized-target.ll": window_around(
+            read(resolver_first_optimized),
+            r"ret %TraceResult_140016000",
+            before=24,
+            after=3,
+        ),
+        "jcc-resolver-select.ll": window_around(
+            read(resolver_jcc_optimized), r"select i1", before=18, after=20
+        ),
+        "recovered-skeleton-switch.ll": window_around(
+            read(recovered_skeleton), r"switch i64", before=4, after=12
+        ),
+        "recovered-round8-first-compare.ll": window_around(
+            read(recovered_round8), r"icmp eq i32 %4, 1859", before=12, after=32
+        ),
+        "recovered-residual-membership.ll": window_around(
+            read(recovered_residual), r"icmp eq i32 %4, 1859", before=12, after=72
+        ),
         "recovered-final.ll": read(recovered_final),
     }
-    snippet_paths = {name: write_snippet(name, content) for name, content in snippets.items()}
+    snippet_paths = {
+        name: write_snippet(name, content) for name, content in snippets.items()
+    }
 
     stats_json = ARTIFACT_DIR / "ir-stage-stats.json"
-    stats_json.write_text(json.dumps([asdict(s) for s in stats], indent=2), encoding="utf-8")
+    stats_json.write_text(
+        json.dumps([asdict(s) for s in stats], indent=2), encoding="utf-8"
+    )
 
     stats_csv = ARTIFACT_DIR / "ir-stage-stats.csv"
     with stats_csv.open("w", encoding="utf-8", newline="") as f:
@@ -125,21 +162,27 @@ def main() -> None:
             f"{item.stores} | {constants} |"
         )
 
-    report_lines.extend([
-        "",
-        "## Snippets",
-        "",
-    ])
+    report_lines.extend(
+        [
+            "",
+            "## Snippets",
+            "",
+        ]
+    )
     for name, path in snippet_paths.items():
         report_lines.append(f"- `{path.relative_to(ROOT).as_posix()}`")
 
     snippet_bundle_lines = ["# Intermediate IR snippets", ""]
     for name, content in snippets.items():
-        snippet_bundle_lines.extend([f"## {name}", "", "```llvm", content.rstrip(), "```", ""])
+        snippet_bundle_lines.extend(
+            [f"## {name}", "", "```llvm", content.rstrip(), "```", ""]
+        )
     snippet_bundle = ARTIFACT_DIR / "ir-snippets.md"
     snippet_bundle.write_text("\n".join(snippet_bundle_lines), encoding="utf-8")
 
-    (ARTIFACT_DIR / "summary.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    (ARTIFACT_DIR / "summary.md").write_text(
+        "\n".join(report_lines) + "\n", encoding="utf-8"
+    )
 
     print(f"wrote {stats_json.relative_to(ROOT)}")
     print(f"wrote {stats_csv.relative_to(ROOT)}")

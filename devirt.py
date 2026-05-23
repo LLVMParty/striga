@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from llvm import Linkage, Opcode, Value, create_context
+from llvm import Function, Linkage, Opcode, Value, create_context
 
 from bfs import lift_bfs
 from container import PEContainer
@@ -35,7 +35,9 @@ VM_MEM_SIZE = 0x300
 # (TEB/PEB), without making tracing track those bytes as VM stack state.
 LOCAL_MEM_SIZE = (PEB_BASE + 0x18) - VM_MEM_BASE
 
-OPT_PIPELINE = "sroa,instcombine<no-verify-fixpoint>,early-cse<memssa>,gvn,simplifycfg,dse,adce"
+OPT_PIPELINE = (
+    "sroa,instcombine<no-verify-fixpoint>,early-cse<memssa>,gvn,simplifycfg,dse,adce"
+)
 MAX_TRACE_NODES = 2000
 MAX_FOLD_ROUNDS = 8
 DUMP_DIR_ENV = "STRIGA_DEVIRT_DUMP_DIR"
@@ -163,9 +165,13 @@ class HandlerTracer:
         self._dumped_resolver_stages.add(key)
         out_dir = self.dump_dir / "resolvers"
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / f"{addr:x}-{stage}.ll").write_text(str(resolver) + "\n", encoding="utf-8")
+        (out_dir / f"{addr:x}-{stage}.ll").write_text(
+            str(resolver) + "\n", encoding="utf-8"
+        )
 
-    def initial_state(self, *, symbolic_rcx: bool = True, rcx_value: int = 0) -> TraceState:
+    def initial_state(
+        self, *, symbolic_rcx: bool = True, rcx_value: int = 0
+    ) -> TraceState:
         with create_context() as context:
             with context.create_module("state_layout") as module:
                 sem = lift_bfs(module, self.container, FIRST_HANDLER, verbose=False)
@@ -182,8 +188,7 @@ class HandlerTracer:
         )
 
         mem = {
-            addr: AbsValue.concrete(8, 0)
-            for addr in range(self.mem_base, self.mem_end)
+            addr: AbsValue.concrete(8, 0) for addr in range(self.mem_base, self.mem_end)
         }
         self._write_int(mem, ENTRY_RSP, 64, RETURN_SENTINEL)
         self._write_int(mem, VM_ENTRY_RSP, 64, BYTECODE_RVA)
@@ -235,12 +240,22 @@ class HandlerTracer:
                         )
 
                     for name, ty in sem.reg_types.items():
-                        abs_value = state.regs.get(name, AbsValue.concrete(ty.int_width, 0))
-                        value = self._materialize_abs_value(types, abs_value, param_values[("reg", name)] if not abs_value.is_concrete else None)
+                        abs_value = state.regs.get(
+                            name, AbsValue.concrete(ty.int_width, 0)
+                        )
+                        value = self._materialize_abs_value(
+                            types,
+                            abs_value,
+                            param_values[("reg", name)]
+                            if not abs_value.is_concrete
+                            else None,
+                        )
                         ir.store(value, reg_ptr(name))
 
                     self._store_mem64(ir, types, ram, TEB_BASE + 0x60, PEB_BASE)
-                    self._store_mem64(ir, types, ram, PEB_BASE + 0x10, self.container.image_base)
+                    self._store_mem64(
+                        ir, types, ram, PEB_BASE + 0x10, self.container.image_base
+                    )
 
                     for mem_addr in range(self.mem_base, self.mem_end, 8):
                         ptr = ir.gep(types.i8, ram, [types.i64.constant(mem_addr)])
@@ -249,14 +264,18 @@ class HandlerTracer:
                             byte_addr = mem_addr + byte_index
                             if byte_addr >= self.mem_end:
                                 break
-                            abs_value = state.mem.get(byte_addr, AbsValue.concrete(8, 0))
+                            abs_value = state.mem.get(
+                                byte_addr, AbsValue.concrete(8, 0)
+                            )
                             if abs_value.is_concrete:
                                 byte = types.i8.constant(abs_value.value or 0)
                             else:
                                 byte = param_values[("mem", byte_addr)]
                             widened = ir.zext(byte, types.i64)
                             if byte_index:
-                                widened = ir.shl(widened, types.i64.constant(byte_index * 8))
+                                widened = ir.shl(
+                                    widened, types.i64.constant(byte_index * 8)
+                                )
                             value = ir.or_(value, widened)
                         store = ir.store(value, ptr)
                         store.inst_alignment = 1
@@ -282,7 +301,9 @@ class HandlerTracer:
 
                 return self._read_outcomes(resolver, sem, result_ty, ram, state)
 
-    def _materialize_abs_value(self, types, abs_value: AbsValue, param: Value | None) -> Value:
+    def _materialize_abs_value(
+        self, types, abs_value: AbsValue, param: Value | None
+    ) -> Value:
         ty = types.int_n(abs_value.width)
         if abs_value.is_concrete:
             return ty.constant(abs_value.value or 0)
@@ -294,7 +315,15 @@ class HandlerTracer:
         store = ir.store(types.i64.constant(value), ptr)
         store.inst_alignment = 1
 
-    def _rewrite_hooks(self, module, resolver: Value, sem, state_alloca: Value, ram: Value, result_ty) -> None:
+    def _rewrite_hooks(
+        self,
+        module,
+        resolver: Function,
+        sem,
+        state_alloca: Value,
+        ram: Value,
+        result_ty,
+    ) -> None:
         hook_events = {
             "__striga_jmp": 1,
             "__striga_call": 2,
@@ -355,7 +384,7 @@ class HandlerTracer:
     def _fold_ram_loads(
         self,
         module,
-        resolver: Value,
+        resolver: Function,
         ram: Value,
         input_state: TraceState,
         param_values: dict[tuple[str, str | int], Value],
@@ -383,7 +412,9 @@ class HandlerTracer:
                     for off in finite_offsets
                 ):
                     with inst.create_builder() as ir:
-                        replacement = self._build_static_load_expr(ir, inst.type, offset_value, size)
+                        replacement = self._build_static_load_expr(
+                            ir, inst.type, offset_value, size
+                        )
 
                 if replacement is None:
                     finite_offsets = self._finite_ints(offset_value)
@@ -410,7 +441,9 @@ class HandlerTracer:
                     folded += 1
         return folded
 
-    def _collect_store_ranges(self, resolver: Value, ram: Value) -> list[tuple[int, int]]:
+    def _collect_store_ranges(
+        self, resolver: Function, ram: Value
+    ) -> list[tuple[int, int]]:
         ranges: list[tuple[int, int]] = []
         for block in resolver.basic_blocks:
             for inst in block.instructions:
@@ -462,8 +495,12 @@ class HandlerTracer:
             return ty.constant(str(int.from_bytes(data, "little")), 10)
         assert offset_value.is_instruction and offset_value.opcode == Opcode.Select
         cond = offset_value.get_operand(0)
-        true_value = self._build_static_load_expr(ir, ty, offset_value.get_operand(1), size)
-        false_value = self._build_static_load_expr(ir, ty, offset_value.get_operand(2), size)
+        true_value = self._build_static_load_expr(
+            ir, ty, offset_value.get_operand(1), size
+        )
+        false_value = self._build_static_load_expr(
+            ir, ty, offset_value.get_operand(2), size
+        )
         return ir.select(cond, true_value, false_value)
 
     def _build_tracked_mem_expr(
@@ -500,13 +537,17 @@ class HandlerTracer:
         )
         return ir.select(cond, true_value, false_value)
 
-    def _range_overlaps_any(self, addr: int, size: int, ranges: Iterable[tuple[int, int]]) -> bool:
+    def _range_overlaps_any(
+        self, addr: int, size: int, ranges: Iterable[tuple[int, int]]
+    ) -> bool:
         end = addr + size
-        return any(max(addr, start) < min(end, start + width) for start, width in ranges)
+        return any(
+            max(addr, start) < min(end, start + width) for start, width in ranges
+        )
 
     def _read_outcomes(
         self,
-        resolver: Value,
+        resolver: Function,
         sem,
         result_ty,
         ram: Value,
@@ -524,7 +565,9 @@ class HandlerTracer:
             event_value = fields[0]
             target_value = fields[1]
             if event_value is None or not event_value.is_constant_int:
-                outcomes.append(TraceOutcome("unresolved", None, self._unknown_state(sem)))
+                outcomes.append(
+                    TraceOutcome("unresolved", None, self._unknown_state(sem))
+                )
                 continue
             event = {1: "jmp", 2: "call", 3: "ret", 4: "syscall"}.get(
                 event_value.const_zext_value,
@@ -543,7 +586,9 @@ class HandlerTracer:
                 regs: dict[str, AbsValue] = {}
                 idx = 2
                 for name, ty in sem.reg_types.items():
-                    regs[name] = self._classify_value(specialized[idx], ty.int_width, f"{name}_{block.name}")
+                    regs[name] = self._classify_value(
+                        specialized[idx], ty.int_width, f"{name}_{block.name}"
+                    )
                     idx += 1
 
                 outcomes.append(
@@ -551,14 +596,16 @@ class HandlerTracer:
                         event,
                         target,
                         TraceState(regs, dict(post_mem)),
-                        target_expr=str(target_value) if target_value is not None else "",
+                        target_expr=str(target_value)
+                        if target_value is not None
+                        else "",
                     )
                 )
         return outcomes or [TraceOutcome("unresolved", None, self._unknown_state(sem))]
 
     def _derive_post_mem(
         self,
-        resolver: Value,
+        resolver: Function,
         ram: Value,
         input_state: TraceState,
     ) -> dict[int, AbsValue]:
@@ -615,7 +662,11 @@ class HandlerTracer:
         target: Value | None,
         state_fields: list[Value | None],
     ) -> list[tuple[int | None, tuple[Value, bool] | None]]:
-        if target is not None and target.is_instruction and target.opcode == Opcode.Select:
+        if (
+            target is not None
+            and target.is_instruction
+            and target.opcode == Opcode.Select
+        ):
             split = self._split_select_constants(target, use_leaf_as_target=True)
             if split:
                 return split
@@ -624,10 +675,15 @@ class HandlerTracer:
             if state_field is None:
                 continue
             if state_field.is_instruction and state_field.opcode == Opcode.Select:
-                split = self._split_select_constants(state_field, use_leaf_as_target=False)
+                split = self._split_select_constants(
+                    state_field, use_leaf_as_target=False
+                )
                 if split:
                     if target is not None and target.is_constant_int:
-                        return [(target.const_zext_value, constraint) for _, constraint in split]
+                        return [
+                            (target.const_zext_value, constraint)
+                            for _, constraint in split
+                        ]
                     return split
 
         if target is not None and target.is_constant_int:
@@ -652,11 +708,17 @@ class HandlerTracer:
             out.append((target, (cond, False)))
         return out
 
-    def _specialize_value(self, value: Value | None, constraint: tuple[Value, bool] | None) -> Value | None:
+    def _specialize_value(
+        self, value: Value | None, constraint: tuple[Value, bool] | None
+    ) -> Value | None:
         if value is None or constraint is None:
             return value
         cond, want_true = constraint
-        if value.is_instruction and value.opcode == Opcode.Select and value.get_operand(0) == cond:
+        if (
+            value.is_instruction
+            and value.opcode == Opcode.Select
+            and value.get_operand(0) == cond
+        ):
             return value.get_operand(1 if want_true else 2)
         return value
 
@@ -676,7 +738,9 @@ class HandlerTracer:
         }
         return TraceState(regs, mem)
 
-    def _write_int(self, mem: dict[int, AbsValue], addr: int, width: int, value: int) -> None:
+    def _write_int(
+        self, mem: dict[int, AbsValue], addr: int, width: int, value: int
+    ) -> None:
         for i in range(width // 8):
             mem[addr + i] = AbsValue.concrete(8, (value >> (8 * i)) & 0xFF)
 
@@ -714,7 +778,9 @@ def build_trace_graph(tracer: HandlerTracer, initial_state: TraceState) -> Trace
                     succ = TraceNode(outcome.target, outcome.post_state, dst_key)
                     graph.nodes[dst_key] = succ
                     worklist.append(succ)
-            graph.edges.append(TraceEdge(node.key, outcome.event, outcome.target, dst_key))
+            graph.edges.append(
+                TraceEdge(node.key, outcome.event, outcome.target, dst_key)
+            )
             if outcome.event in {"ret", "call", "syscall", "unresolved"}:
                 continue
     return graph
@@ -751,7 +817,9 @@ def _define_noop_hook(module, name: str) -> None:
         ir.ret_void()
 
 
-def _materialize_mem_chunks(ir, types, ram: Value, state: TraceState, mem_base: int, mem_size: int) -> None:
+def _materialize_mem_chunks(
+    ir, types, ram: Value, state: TraceState, mem_base: int, mem_size: int
+) -> None:
     for mem_addr in range(mem_base, mem_base + mem_size, 8):
         value = types.i64.constant(0)
         all_concrete = True
@@ -775,7 +843,9 @@ def _materialize_mem_chunks(ir, types, ram: Value, state: TraceState, mem_base: 
         store.inst_alignment = 1
 
 
-def _dump_recovered_stage(tracer: HandlerTracer, stage: str, recovered: Value | str) -> None:
+def _dump_recovered_stage(
+    tracer: HandlerTracer, stage: str, recovered: Value | str
+) -> None:
     if tracer.dump_dir is None:
         return
     out_dir = tracer.dump_dir / "recovered"
@@ -784,7 +854,9 @@ def _dump_recovered_stage(tracer: HandlerTracer, stage: str, recovered: Value | 
     (out_dir / f"{stage}.ll").write_text(text, encoding="utf-8")
 
 
-def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer, output_path: Path) -> None:
+def recover_ir(
+    container: PEContainer, graph: TraceGraph, tracer: HandlerTracer, output_path: Path
+) -> None:
     with create_context() as context:
         types = context.types
         with context.create_module("binaryshield_recovered") as module:
@@ -812,7 +884,9 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
             vm_mem: Value
             with entry.create_builder() as ir:
                 state_alloca = ir.alloca(sem0.state_ty, "state")
-                vm_mem = ir.alloca(types.i8, types.i64.constant(LOCAL_MEM_SIZE), "vm_mem")
+                vm_mem = ir.alloca(
+                    types.i8, types.i64.constant(LOCAL_MEM_SIZE), "vm_mem"
+                )
 
                 def reg_ptr(reg_name: str) -> Value:
                     return ir.struct_gep(
@@ -822,9 +896,13 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
                         reg_name,
                     )
 
-                entry_node = next(node for node in graph.nodes.values() if node.addr == FIRST_HANDLER)
+                entry_node = next(
+                    node for node in graph.nodes.values() if node.addr == FIRST_HANDLER
+                )
                 for name, ty in sem0.reg_types.items():
-                    abs_value = entry_node.state.regs.get(name, AbsValue.concrete(ty.int_width, 0))
+                    abs_value = entry_node.state.regs.get(
+                        name, AbsValue.concrete(ty.int_width, 0)
+                    )
                     if name == "rcx":
                         value = recovered.get_param(0)
                     elif abs_value.is_concrete:
@@ -833,8 +911,12 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
                         value = ty.constant(0)
                     ir.store(value, reg_ptr(name))
                 tracer._store_mem64(ir, types, ram, TEB_BASE + 0x60, PEB_BASE)
-                tracer._store_mem64(ir, types, ram, PEB_BASE + 0x10, container.image_base)
-                _materialize_mem_chunks(ir, types, ram, entry_node.state, tracer.mem_base, tracer.mem_size)
+                tracer._store_mem64(
+                    ir, types, ram, PEB_BASE + 0x10, container.image_base
+                )
+                _materialize_mem_chunks(
+                    ir, types, ram, entry_node.state, tracer.mem_base, tracer.mem_size
+                )
                 ir.br(blocks[entry_node.key])
 
             edges_by_src: dict[NodeKey, list[TraceEdge]] = {}
@@ -845,6 +927,7 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
                 sem = sem_by_addr[node.addr]
                 block = blocks[key]
                 with block.create_builder() as ir:
+
                     def reg_ptr(reg_name: str) -> Value:
                         return ir.struct_gep(
                             sem0.state_ty,
@@ -856,8 +939,12 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
                     for name, ty in sem0.reg_types.items():
                         abs_value = node.state.regs.get(name)
                         if abs_value is not None and abs_value.is_concrete:
-                            ir.store(_const_int(ty, abs_value.value or 0), reg_ptr(name))
-                    _materialize_mem_chunks(ir, types, ram, node.state, tracer.mem_base, tracer.mem_size)
+                            ir.store(
+                                _const_int(ty, abs_value.value or 0), reg_ptr(name)
+                            )
+                    _materialize_mem_chunks(
+                        ir, types, ram, node.state, tracer.mem_base, tracer.mem_size
+                    )
                     ir.call(sem.function, [state_alloca, ram])
 
                     outgoing = edges_by_src.get(key, [])
@@ -877,23 +964,39 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
                             ir.br(unresolved_block)
                         else:
                             reg_name, cases = discriminator
-                            reg_value = ir.load(sem0.reg_types[reg_name], reg_ptr(reg_name))
+                            reg_value = ir.load(
+                                sem0.reg_types[reg_name], reg_ptr(reg_name)
+                            )
                             switch = ir.switch_(reg_value, unresolved_block, len(cases))
                             for case_value, edge in cases:
                                 if edge.dst is not None:
                                     switch.add_case(
-                                        _const_int(sem0.reg_types[reg_name], case_value),
+                                        _const_int(
+                                            sem0.reg_types[reg_name], case_value
+                                        ),
                                         blocks[edge.dst],
                                     )
 
             with exit_block.create_builder() as ir:
-                rax_ptr = ir.struct_gep(sem0.state_ty, state_alloca, sem0.reg_indices["rax"], "rax_exit")
+                rax_ptr = ir.struct_gep(
+                    sem0.state_ty, state_alloca, sem0.reg_indices["rax"], "rax_exit"
+                )
                 ir.ret(ir.load(types.i64, rax_ptr))
             with unresolved_block.create_builder() as ir:
-                rax_ptr = ir.struct_gep(sem0.state_ty, state_alloca, sem0.reg_indices["rax"], "rax_unresolved")
+                rax_ptr = ir.struct_gep(
+                    sem0.state_ty,
+                    state_alloca,
+                    sem0.reg_indices["rax"],
+                    "rax_unresolved",
+                )
                 ir.ret(ir.load(types.i64, rax_ptr))
 
-            for hook in ("__striga_jmp", "__striga_call", "__striga_ret", "__striga_syscall"):
+            for hook in (
+                "__striga_jmp",
+                "__striga_call",
+                "__striga_ret",
+                "__striga_syscall",
+            ):
                 _define_noop_hook(module, hook)
 
             _dump_recovered_stage(tracer, "01-skeleton-before-inline", recovered)
@@ -910,12 +1013,16 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
                 module.optimize(OPT_PIPELINE)
                 fold_static_image_loads(recovered, ram, tracer)
                 if i in {0, MAX_FOLD_ROUNDS - 1}:
-                    _dump_recovered_stage(tracer, f"04-cleanup-round-{i + 1}", recovered)
+                    _dump_recovered_stage(
+                        tracer, f"04-cleanup-round-{i + 1}", recovered
+                    )
                 module.verify_or_raise()
             module.optimize("default<O2>")
             module.verify_or_raise()
             residual_ir = str(recovered) + "\n"
-            _dump_recovered_stage(tracer, "05-residual-before-final-pattern-cleanup", residual_ir)
+            _dump_recovered_stage(
+                tracer, "05-residual-before-final-pattern-cleanup", residual_ir
+            )
             clean_ir = _try_clean_binaryshield_membership_ir(residual_ir) or residual_ir
             _dump_recovered_stage(tracer, "06-final-clean", clean_ir)
             output_path.write_text(clean_ir, encoding="utf-8")
@@ -989,7 +1096,7 @@ def _try_clean_binaryshield_membership_ir(residual_ir: str) -> str | None:
 
 
 def localize_vm_memory(
-    function: Value,
+    function: Function,
     ram: Value,
     vm_mem: Value,
     tracer: HandlerTracer,
@@ -1017,7 +1124,9 @@ def localize_vm_memory(
     return changed
 
 
-def fold_static_image_loads(function: Value, ram: Value, tracer: HandlerTracer) -> int:
+def fold_static_image_loads(
+    function: Function, ram: Value, tracer: HandlerTracer
+) -> int:
     store_ranges = tracer._collect_store_ranges(function, ram)
     folded = 0
     for block in list(function.basic_blocks):
@@ -1039,7 +1148,9 @@ def fold_static_image_loads(function: Value, ram: Value, tracer: HandlerTracer) 
             ):
                 continue
             with inst.create_builder() as ir:
-                replacement = tracer._build_static_load_expr(ir, inst.type, offset_value, size)
+                replacement = tracer._build_static_load_expr(
+                    ir, inst.type, offset_value, size
+                )
             inst.replace_all_uses_with(replacement)
             inst.erase_from_parent()
             folded += 1
