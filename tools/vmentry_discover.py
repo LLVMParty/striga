@@ -30,6 +30,7 @@ from tools.bright_step import (
     build_bright_wrapper,
     call_name,
     dump,
+    find_instruction_by_name,
     get_or_create_stack_alloca,
     insert_stack_snapshots,
     match_memory_ptr_base_offset,
@@ -65,6 +66,9 @@ class Seed:
 class DiscoveryConfig(BrightConfig):
     follow_calls: set[int] = field(default_factory=set)
     cutpoints: set[int] = field(default_factory=set)
+    take_branches: dict[int, int] = field(default_factory=dict)
+    assumed_loads: dict[int, int] = field(default_factory=dict)
+    localize_writable_image: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,11 @@ class DiscoveryResult:
 
 def format_int(value: int) -> str:
     return hex(value) if abs(value) >= 10 else str(value)
+
+
+def parse_int_pair(text: str) -> tuple[int, int]:
+    lhs, rhs = text.split("=", 1)
+    return parse_int(lhs), parse_int(rhs)
 
 
 def mask_value(value: int, width: int | None) -> int:
@@ -202,6 +211,21 @@ class DiscoveryLifter:
                 continue
 
             successors = sem.lift_bytes(rip, code)
+            if rip in self.cfg.take_branches:
+                target = self.cfg.take_branches[rip]
+                if not any(
+                    successor.dst.is_constant
+                    and successor.dst.const_zext_value == target
+                    for successor in successors
+                ):
+                    raise RuntimeError(
+                        f"configured branch target {target:#x} is not a successor of {rip:#x}"
+                    )
+                self._force_branch_target(sem, rip, target)
+                last_src = rip
+                rip = target
+                continue
+
             fallthrough = rip + insn.size
             is_linear = (
                 len(successors) == 1
@@ -229,6 +253,17 @@ class DiscoveryLifter:
                 )
             last_src = rip
             rip = fallthrough
+
+    def _force_branch_target(self, sem: Semantics, rip: int, target: int) -> None:
+        block = sem.insn_blocks.get(rip)
+        if block is None or block.terminator is None:
+            raise RuntimeError(f"branch block missing terminator at {rip:#x}")
+        terminator = block.terminator
+        with terminator.create_builder() as ir:
+            ir.position_before(terminator)
+            ir.br(sem.get_or_create_block(target))
+        terminator.erase_from_parent()
+        sem.module.verify_or_raise()
 
     def _lift_followed_call(self, sem: Semantics, insn) -> list[Successor]:
         target = insn.operands[0].imm
@@ -388,6 +423,177 @@ def instruction_address_from_metadata(inst: Value) -> int | None:
     return int(operands[0].string, 0)
 
 
+def apply_assumed_loads(function: Function, assumptions: dict[int, int]) -> int:
+    if not assumptions:
+        return 0
+    changed = 0
+    for block in list(function.basic_blocks):
+        for inst in list(block.instructions):
+            if inst.opcode != Opcode.Load or not inst.type.is_integer:
+                continue
+            insn_addr = instruction_address_from_metadata(inst)
+            if insn_addr not in assumptions:
+                continue
+            value = mask_value(assumptions[insn_addr], inst.type.int_width)
+            inst.replace_all_uses_with(inst.type.constant(value))
+            inst.erase_from_parent()
+            changed += 1
+    return changed
+
+
+@dataclass(frozen=True)
+class WritableImageSection:
+    name: str
+    start: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.start + self.size
+
+
+@dataclass
+class WritableImageOverlay:
+    initialized_slots: set[tuple[str, int, int]] = field(default_factory=set)
+
+
+def writable_image_sections(container: PEContainer) -> list[WritableImageSection]:
+    sections: list[WritableImageSection] = []
+    for section in container.pe.sections:
+        characteristics = int(getattr(section, "Characteristics", 0) or 0)
+        if characteristics & 0x80000000 == 0:
+            continue
+        raw_name = getattr(section, "Name", b"") or b""
+        name = raw_name.rstrip(b"\0").decode(errors="ignore") or "section"
+        name = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+        virtual_size = int(getattr(section, "Misc_VirtualSize", 0) or 0)
+        raw_size = int(getattr(section, "SizeOfRawData", 0) or 0)
+        virtual_address = int(getattr(section, "VirtualAddress", 0) or 0)
+        size = max(virtual_size, raw_size)
+        sections.append(
+            WritableImageSection(name, container.image_base + virtual_address, size)
+        )
+    return sections
+
+
+def find_writable_section(
+    sections: list[WritableImageSection], addr: int, size: int
+) -> WritableImageSection | None:
+    for section in sections:
+        if section.start <= addr and addr + size <= section.end:
+            return section
+    return None
+
+
+def get_or_create_overlay_alloca(function: Function, section: WritableImageSection) -> Value:
+    name = f"image_overlay_{section.name}_{section.start:x}"
+    existing = find_instruction_by_name(function, name)
+    if existing is not None:
+        return existing
+    types = function.module.context.types
+    entry = function.entry_block
+    first = entry.first_instruction
+    if first is None:
+        with entry.create_builder() as ir:
+            ir.position_at_end(entry)
+            return ir.alloca(types.i8, types.i64.constant(section.size), name)
+    with first.create_builder() as ir:
+        ir.position_before(first)
+        return ir.alloca(types.i8, types.i64.constant(section.size), name)
+
+
+def entry_after_allocas(function: Function) -> Value | None:
+    for inst in function.entry_block.instructions:
+        if inst.opcode != Opcode.Alloca:
+            return inst
+    return None
+
+
+def insert_overlay_initializer(
+    function: Function,
+    overlay: Value,
+    section: WritableImageSection,
+    addr: int,
+    size: int,
+    value: int,
+) -> None:
+    types = function.module.context.types
+    insert_before = entry_after_allocas(function)
+    if insert_before is None:
+        with function.entry_block.create_builder() as ir:
+            ir.position_at_end(function.entry_block)
+            ptr = ir.gep(types.i8, overlay, [types.i64.constant(addr - section.start)])
+            store = ir.store(types.int_n(size * 8).constant(value), ptr)
+            store.inst_alignment = 1
+        return
+    with insert_before.create_builder() as ir:
+        ir.position_before(insert_before)
+        ptr = ir.gep(types.i8, overlay, [types.i64.constant(addr - section.start)])
+        store = ir.store(types.int_n(size * 8).constant(value), ptr)
+        store.inst_alignment = 1
+
+
+def rewrite_writable_image_memory(
+    function: Function,
+    ram: Value,
+    tracer: HandlerTracer,
+    seeds: list[Seed],
+    overlay: WritableImageOverlay,
+) -> int:
+    sections = writable_image_sections(tracer.container)
+    if not sections:
+        return 0
+    changed = 0
+    evaluator = SinkEvaluator(function, seeds)
+    for block in list(function.basic_blocks):
+        for inst in list(block.instructions):
+            if inst.opcode not in {Opcode.Load, Opcode.Store}:
+                continue
+            ptr_operand_index = 0 if inst.opcode == Opcode.Load else 1
+            ptr = inst.get_operand(ptr_operand_index)
+            offset_value = tracer._ram_gep_offset(ptr, ram)
+            if offset_value is None:
+                continue
+            width = inst.type.int_width if inst.opcode == Opcode.Load else inst.get_operand(0).type.int_width
+            if width % 8 != 0:
+                continue
+            size = width // 8
+            offsets = tracer._finite_ints(offset_value)
+            if offsets is None or len(offsets) != 1:
+                continue
+            addr = next(iter(offsets))
+            section = find_writable_section(sections, addr, size)
+            if section is None:
+                continue
+            overlay_alloca = get_or_create_overlay_alloca(function, section)
+            slot = (section.name, addr, size)
+            if slot not in overlay.initialized_slots:
+                data = tracer.container.get_data(addr, size)
+                value = int.from_bytes(data, "little")
+                insert_overlay_initializer(function, overlay_alloca, section, addr, size, value)
+                if inst.opcode == Opcode.Load:
+                    load_insn = instruction_address_from_metadata(inst) or 0
+                    addr_expr = evaluator.eval_value(offset_value).with_width(64).text
+                    seeds.append(
+                        Seed(
+                            "image_load",
+                            load_insn,
+                            value,
+                            f"initial writable image i{width} at {addr:#x}; addr_expr={addr_expr}",
+                        )
+                    )
+                overlay.initialized_slots.add(slot)
+            with inst.create_builder() as ir:
+                replacement = ir.gep(
+                    function.module.context.types.i8,
+                    overlay_alloca,
+                    [function.module.context.types.i64.constant(addr - section.start)],
+                )
+            inst.set_operand(ptr_operand_index, replacement)
+            changed += 1
+    return changed
+
+
 ImageAddressProvenance = dict[tuple[int, int, int], str]
 
 
@@ -492,6 +698,7 @@ def optimize_for_discovery(
     address_provenance = capture_static_image_load_address_provenance(
         wrapper, memory, tracer, seeds
     )
+    writable_overlay = WritableImageOverlay()
     snapshotted_stack_slots: set[StackSlot] = set()
     stack_snapshot_sinks = 0
     boundary_observables: list[Observable] = []
@@ -499,6 +706,12 @@ def optimize_for_discovery(
         module.optimize(OPT_PIPELINE)
         memory = wrapper.get_param(0)
         rewrite_result = rewrite_env_memory(wrapper, memory, env, container.image_base)
+        assumed = apply_assumed_loads(wrapper, cfg.assumed_loads)
+        localized_writable = 0
+        if cfg.localize_writable_image:
+            localized_writable = rewrite_writable_image_memory(
+                wrapper, memory, tracer, seeds, writable_overlay
+            )
         new_stack_slots = set(rewrite_result.stack_stores) - snapshotted_stack_slots
         stack_snapshot_sinks += insert_stack_snapshots(wrapper, env, new_stack_slots)
         snapshotted_stack_slots |= new_stack_slots
@@ -507,9 +720,16 @@ def optimize_for_discovery(
         )
         module.verify_or_raise()
         dump(cfg.out_dir / f"03-discovery-round-{i + 1:02d}.ll", module)
-        if rewrite_result.changed or folded or new_stack_slots:
+        if rewrite_result.changed or assumed or localized_writable or folded or new_stack_slots:
             boundary_observables = SinkEvaluator(wrapper, seeds).observables()
-        if rewrite_result.changed == 0 and folded == 0 and not new_stack_slots and i > 0:
+        if (
+            rewrite_result.changed == 0
+            and assumed == 0
+            and localized_writable == 0
+            and folded == 0
+            and not new_stack_slots
+            and i > 0
+        ):
             break
 
     if not boundary_observables:
@@ -522,7 +742,8 @@ def optimize_for_discovery(
     (cfg.out_dir / "optimizer-summary.txt").write_text(
         f"identity_sinks_removed={removed_identity_sinks}\n"
         f"stack_snapshot_slots={len(snapshotted_stack_slots)}\n"
-        f"stack_snapshot_sinks={stack_snapshot_sinks}\n",
+        f"stack_snapshot_sinks={stack_snapshot_sinks}\n"
+        f"writable_image_slots={len(writable_overlay.initialized_slots)}\n",
         encoding="utf-8",
     )
     return boundary_observables
@@ -1080,6 +1301,27 @@ def main() -> None:
         type=parse_int,
         help="Native address where discovery should stop and emit sink_exit_rip.",
     )
+    parser.add_argument(
+        "--take-branch",
+        action="append",
+        default=[],
+        type=parse_int_pair,
+        metavar="RIP=TARGET",
+        help="Force a lifted conditional branch to a concrete successor and continue discovery.",
+    )
+    parser.add_argument(
+        "--assume-load",
+        action="append",
+        default=[],
+        type=parse_int_pair,
+        metavar="INSN=VALUE",
+        help="Replace integer loads emitted for a native instruction with a concrete value.",
+    )
+    parser.add_argument(
+        "--localize-writable-image",
+        action="store_true",
+        help="Model concrete writable-image loads/stores with local mutable section overlays.",
+    )
     args = parser.parse_args()
 
     cfg = DiscoveryConfig(
@@ -1093,6 +1335,9 @@ def main() -> None:
         stop_at_call=True,
         follow_calls=set(args.follow_call),
         cutpoints=set(args.cutpoint),
+        take_branches=dict(args.take_branch),
+        assumed_loads=dict(args.assume_load),
+        localize_writable_image=args.localize_writable_image,
     )
     run(cfg)
 
