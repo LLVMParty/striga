@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BinaryShield Devirtualization Walkthrough</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Source+Sans+3:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --panel: #fffdf8;
+      --panel-strong: #f0ede5;
+      --ink: #20201d;
+      --muted: #686760;
+      --line: #d8d2c5;
+      --accent: #335c67;
+      --accent-2: #8f5536;
+      --code-bg: #1f2426;
+      --code-ink: #edf1ef;
+      --code-muted: #aab5b1;
+      --good: #2f6f52;
+      --warn: #8f5536;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 24px;
+      --space-6: 32px;
+      --space-7: 48px;
+      --max: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Source Sans 3", Arial, sans-serif;
+      font-size: 17px;
+      line-height: 1.58;
+    }
+
+    a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: var(--accent-2); }
+
+    .page {
+      max-width: var(--max);
+      margin: 0 auto;
+      padding: var(--space-6) var(--space-5) var(--space-7);
+    }
+
+    header.hero {
+      border-bottom: 1px solid var(--line);
+      padding: var(--space-5) 0 var(--space-6);
+      margin-bottom: var(--space-6);
+    }
+
+    .eyebrow {
+      color: var(--accent-2);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      margin-bottom: var(--space-3);
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, h4 {
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.12;
+      margin: 0;
+    }
+
+    h1 {
+      max-width: 900px;
+      font-size: clamp(40px, 6vw, 70px);
+      margin-bottom: var(--space-4);
+    }
+
+    .lead {
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 21px;
+      line-height: 1.42;
+      margin: 0 0 var(--space-5);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin-top: var(--space-5);
+    }
+
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: var(--space-4);
+    }
+
+    .metric strong {
+      display: block;
+      color: var(--ink);
+      font-size: 27px;
+      line-height: 1;
+      margin-bottom: var(--space-2);
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 238px minmax(0, 1fr);
+      gap: var(--space-6);
+      align-items: start;
+    }
+
+    nav.toc {
+      position: sticky;
+      top: var(--space-5);
+      border-left: 2px solid var(--line);
+      padding-left: var(--space-4);
+      font-size: 15px;
+    }
+
+    nav.toc h2 {
+      font-size: 13px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: var(--space-3);
+    }
+
+    nav.toc a {
+      display: block;
+      color: var(--ink);
+      padding: 5px 0;
+      text-decoration: none;
+    }
+
+    nav.toc a:hover { color: var(--accent); }
+
+    main { min-width: 0; }
+
+    section {
+      margin-bottom: var(--space-7);
+      scroll-margin-top: var(--space-6);
+    }
+
+    section > h2 {
+      font-size: 34px;
+      margin-bottom: var(--space-4);
+    }
+
+    section > p, section > ul, section > ol {
+      max-width: 820px;
+    }
+
+    h3 {
+      font-size: 24px;
+      margin: var(--space-6) 0 var(--space-3);
+    }
+
+    h4 {
+      font-size: 18px;
+      margin: var(--space-4) 0 var(--space-2);
+    }
+
+    p { margin: 0 0 var(--space-4); }
+    ul, ol { margin: 0 0 var(--space-4); padding-left: 1.2em; }
+    li + li { margin-top: var(--space-2); }
+
+    .callout {
+      border-left: 4px solid var(--accent);
+      background: var(--panel);
+      padding: var(--space-4) var(--space-5);
+      margin: var(--space-5) 0;
+    }
+
+    .callout.warning { border-color: var(--warn); }
+    .callout p:last-child { margin-bottom: 0; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin: var(--space-5) 0;
+    }
+
+    .flow div {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: var(--space-4);
+      min-height: 112px;
+    }
+
+    .flow span {
+      display: block;
+      color: var(--accent-2);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: var(--space-2);
+    }
+
+    .flow strong {
+      display: block;
+      font-size: 17px;
+      line-height: 1.25;
+      margin-bottom: var(--space-2);
+    }
+
+    .flow p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.35;
+      margin: 0;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: var(--space-5);
+      align-items: start;
+      margin: var(--space-5) 0;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: var(--space-5);
+    }
+
+    .panel h3:first-child,
+    .panel h4:first-child { margin-top: 0; }
+
+    .panel.compact { padding: var(--space-4); }
+
+    pre {
+      background: var(--code-bg);
+      border-radius: 6px;
+      color: var(--code-ink);
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      margin: var(--space-4) 0;
+      overflow-x: auto;
+      padding: var(--space-4);
+      tab-size: 4;
+    }
+
+    code {
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: .92em;
+    }
+
+    p code, li code, td code {
+      background: rgba(51, 92, 103, .09);
+      border: 1px solid rgba(51, 92, 103, .16);
+      border-radius: 4px;
+      color: #264b54;
+      padding: 1px 4px;
+    }
+
+    pre code { background: transparent; border: 0; color: inherit; padding: 0; }
+
+    .code-label {
+      color: var(--code-muted);
+      display: block;
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      margin-bottom: var(--space-2);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: var(--space-5) 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: var(--space-3) var(--space-4);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--panel-strong);
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: .02em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    td { color: var(--muted); }
+    td strong { color: var(--ink); font-weight: 600; }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin: var(--space-4) 0;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 13px;
+      padding: 4px 9px;
+      background: var(--panel);
+    }
+
+    .status-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin: var(--space-5) 0;
+    }
+
+    .status {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: var(--space-4);
+    }
+
+    .status strong {
+      display: block;
+      margin-bottom: var(--space-2);
+    }
+
+    .status p {
+      color: var(--muted);
+      font-size: 15px;
+      margin: 0;
+    }
+
+    footer {
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: var(--space-7);
+      padding-top: var(--space-5);
+    }
+
+    @media (max-width: 920px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.toc { position: static; border-left: 0; border-top: 1px solid var(--line); padding: var(--space-4) 0 0; }
+      .metrics, .flow, .split, .status-list { grid-template-columns: 1fr; }
+      .page { padding: var(--space-5) var(--space-4) var(--space-6); }
+    }
+
+    @media print {
+      body { background: white; }
+      .page { max-width: none; padding: 0; }
+      nav.toc { display: none; }
+      .layout { display: block; }
+      section { break-inside: avoid; }
+      pre { white-space: pre-wrap; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="eyebrow">Striga devirtualization report</div>
+      <h1>Recovering BinaryShield VM bytecode into clean LLVM IR</h1>
+      <p class="lead">The implementation treats the VM as a partial-evaluation problem. Handler code is lifted to LLVM, concrete VM state is propagated through resolver functions, VM dispatch is turned into graph edges, and LLVM removes bytecode, dispatcher, and VM-state traffic.</p>
+      <div class="metrics" aria-label="Result metrics">
+        <div class="metric"><strong>861</strong><span>traced graph nodes</span></div>
+        <div class="metric"><strong>866</strong><span>resolved graph edges</span></div>
+        <div class="metric"><strong>16</strong><span>final LLVM IR lines</span></div>
+        <div class="metric"><strong>0</strong><span>remaining RAM, hook, or unresolved dispatch tokens</span></div>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav class="toc" aria-label="Contents">
+        <h2>Contents</h2>
+        <a href="#problem">Problem</a>
+        <a href="#pipeline">Pipeline</a>
+        <a href="#state">Trace state</a>
+        <a href="#resolver">Handler resolver</a>
+        <a href="#memory">Memory folding</a>
+        <a href="#graph">Trace graph</a>
+        <a href="#recovery">Recovered IR construction</a>
+        <a href="#intermediate">Intermediate IR</a>
+        <a href="#optimization">Optimization examples</a>
+        <a href="#result">Final result</a>
+        <a href="#verification">Verification</a>
+        <a href="#specifics">Encoded knowledge</a>
+        <a href="#limits">Limitations</a>
+      </nav>
+
+      <main>
+        <section id="problem">
+          <h2>1. Problem</h2>
+          <p>BinaryShield replaces the original function at <code>0x1400016d0</code> with a native x86-64 VM. The VM entry pushes a bytecode RVA, initializes VM context, dispatches through native handlers, and uses indirect jumps to select the next handler.</p>
+          <p>The output we want is LLVM IR for the original program behavior. For this sample, the recovered function takes the Windows x64 first integer argument in <code>rcx</code> and returns the result through <code>rax</code>.</p>
+
+          <div class="callout">
+            <p><strong>Recovered behavior:</strong> return <code>1</code> when the low 32 bits of <code>rcx</code> match one of <code>1859</code>, <code>2418</code>, <code>1638</code>, <code>299902</code>, or <code>29763</code>; return <code>0</code> otherwise.</p>
+          </div>
+
+          <h3>What makes it hard</h3>
+          <ul>
+            <li>Handler targets are computed from bytecode and handler-table values instead of appearing as direct native branches.</li>
+            <li>Original program values and VM book-keeping share x86 registers and memory.</li>
+            <li>Branch conditions are encoded as VM stack values and dispatch choices.</li>
+            <li>The lifter emits a memory-root model through <code>@RAM</code>, so stack, image, TEB, PEB, and VM context initially look like the same address space.</li>
+          </ul>
+        </section>
+
+        <section id="pipeline">
+          <h2>2. Pipeline</h2>
+          <p>The implementation follows the phased design in <code>devirt-plan.md</code>. Each handler is partially evaluated under an abstract state. The resulting graph is rebuilt as one LLVM function and optimized.</p>
+
+          <div class="flow" role="list" aria-label="Pipeline steps">
+            <div role="listitem"><span>01</span><strong>Lift handler</strong><p>Use <code>lift_bfs</code> to translate native handler code into Striga LLVM semantics.</p></div>
+            <div role="listitem"><span>02</span><strong>Resolve outcome</strong><p>Build a resolver, inline the handler, fold static and tracked memory, and read hook returns.</p></div>
+            <div role="listitem"><span>03</span><strong>Build graph</strong><p>Add concrete control-flow edges for each resolved VM dispatch target.</p></div>
+            <div role="listitem"><span>04</span><strong>Recover function</strong><p>Emit one basic block per trace node and lower resolved edges to branches or switches.</p></div>
+            <div role="listitem"><span>05</span><strong>Clean IR</strong><p>Inline, localize VM memory, fold image loads, and run scalar cleanup passes.</p></div>
+          </div>
+
+          <h3>Optimization boundary</h3>
+          <p>The tracer does not need to know which constants are VM internals. It records concrete facts. LLVM decides which computations are dead after dispatch is resolved and program outputs are selected.</p>
+        </section>
+
+        <section id="state">
+          <h2>3. Trace state</h2>
+          <p>The tracer represents handler inputs as concrete values or named symbols. Concrete values include bytecode pointers, stack addresses, handler-table data, and process facts. Symbolic values include original program inputs such as <code>rcx</code>.</p>
+
+          <pre><code><span class="code-label">devirt.py: abstract state model</span>@dataclass(frozen=True)
+class AbsValue:
+    width: int
+    value: int | None = None
+    symbol: str | None = None
+
+    @property
+    def is_concrete(self) -&gt; bool:
+        return self.value is not None
+
+@dataclass
+class TraceState:
+    regs: dict[str, AbsValue]
+    mem: dict[int, AbsValue]
+
+    def concrete_key(self) -&gt; tuple:
+        reg_items = tuple(sorted(
+            (name, value.width, value.value)
+            for name, value in self.regs.items()
+            if value.is_concrete
+        ))
+        mem_items = tuple(sorted(
+            (addr, value.value)
+            for addr, value in self.mem.items()
+            if value.is_concrete and value.value != 0
+        ))
+        return reg_items, mem_items</code></pre>
+
+          <p>The cache key uses concrete state. Symbols are excluded, so equivalent VM states merge even when symbolic names differ.</p>
+
+          <h3>Initial state for this sample</h3>
+          <table>
+            <thead><tr><th>Field</th><th>Value</th><th>Reason</th></tr></thead>
+            <tbody>
+              <tr><td><code>rcx</code></td><td><code>arg_rcx</code></td><td>Original function argument remains symbolic.</td></tr>
+              <tr><td><code>rsp</code></td><td><code>0x10feb0</code> after the VM-entry push</td><td>Mirrors the emulator call frame and the <code>push 0x1678f</code> instruction.</td></tr>
+              <tr><td><code>gsbase</code></td><td>synthetic TEB base</td><td>Lets lifted code resolve <code>gs:[0x60]</code> to the PEB.</td></tr>
+              <tr><td><code>[VM_ENTRY_RSP]</code></td><td><code>0x1678f</code></td><td>Bytecode RVA pushed by the VM entry.</td></tr>
+              <tr><td><code>[ENTRY_RSP]</code></td><td><code>0x7fff0000</code></td><td>Return sentinel used by the emulator and tracer.</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="resolver">
+          <h2>4. Generic handler resolver</h2>
+          <p>The current tracer has no per-handler BinaryShield fast paths. Each handler goes through the same resolver machinery.</p>
+
+          <pre><code><span class="code-label">devirt.py: generic trace_handler structure</span>def trace_handler(self, addr: int, state: TraceState) -&gt; list[TraceOutcome]:
+    with create_context() as context:
+        types = context.types
+        with context.create_module(f"trace_{addr:x}") as module:
+            sem = lift_bfs(module, self.container, addr, verbose=False)
+            ram = module.add_global(types.array(types.i8, 0), "RAM")
+
+            result_fields = [types.i8, types.i64]
+            result_fields.extend(sem.reg_types.values())
+            result_ty = types.struct(f"TraceResult_{addr:x}", result_fields)
+
+            # One resolver parameter per symbolic register or tracked byte.
+            # Concrete fields are materialized as constants.
+            resolver = module.add_function(f"resolver_{addr:x}", resolver_ty)
+            ...
+            ir.call(sem.function, [state_alloca, ram])
+            ir.unreachable()
+
+            module.optimize("always-inline")
+            self._rewrite_hooks(module, resolver, sem, state_alloca, ram, result_ty)
+            ...
+            return self._read_outcomes(resolver, sem, result_ty, ram, state)</code></pre>
+
+          <h3>Hook rewrite</h3>
+          <p>Striga lifted code uses boundary hooks for indirect control transfer. The resolver rewrites each hook call into a structured return containing an event code, target, and full register snapshot.</p>
+
+          <div class="split">
+            <div class="panel compact">
+              <h4>Before hook rewrite</h4>
+              <pre><code>call void @__striga_jmp(i64 %target)
+unreachable</code></pre>
+            </div>
+            <div class="panel compact">
+              <h4>After hook rewrite</h4>
+              <pre><code>%r = insertvalue %TraceResult undef, i8 1, 0
+%r1 = insertvalue %TraceResult %r, i64 %target, 1
+%rax = load i64, ptr %rax_snap
+%r2 = insertvalue %TraceResult %r1, i64 %rax, 2
+ret %TraceResult %r2</code></pre>
+            </div>
+          </div>
+
+          <p>Event code <code>1</code> means <code>jmp</code>, <code>2</code> means <code>call</code>, <code>3</code> means <code>ret</code>, and <code>4</code> means <code>syscall</code>.</p>
+        </section>
+
+        <section id="memory">
+          <h2>5. Memory folding</h2>
+          <p>Handler IR reads from the synthetic <code>@RAM</code> root. The tracer replaces safe loads with constants or symbolic expressions before reading the resolver result.</p>
+
+          <h3>Static image loads</h3>
+          <p>A load from <code>@RAM + constant</code> becomes a constant when the address range is inside the PE image and no store in the resolver aliases the range.</p>
+
+          <pre><code><span class="code-label">devirt.py: load folding rule</span>if finite_offsets and all(
+    self.container.in_range(off)
+    and self.container.in_range(off + size - 1)
+    and not self._range_overlaps_any(off, size, store_ranges)
+    for off in finite_offsets
+):
+    replacement = self._build_static_load_expr(
+        ir, inst.type, offset_value, size
+    )</code></pre>
+
+          <div class="split">
+            <div class="panel compact">
+              <h4>Before folding</h4>
+              <pre><code>%p = getelementptr i8, ptr @RAM, i64 5368802747
+%target_rva = load i32, ptr %p, align 1
+%target = zext i32 %target_rva to i64</code></pre>
+            </div>
+            <div class="panel compact">
+              <h4>After folding</h4>
+              <pre><code>%target = i64 5368802678
+; later normalized to handler VA 0x1400162b1</code></pre>
+            </div>
+          </div>
+
+          <h3>Tracked VM memory</h3>
+          <p>The tracer tracks a bounded scratch range, <code>0x10fd00..0x110000</code>, byte by byte. Loads from concrete tracked addresses become concrete or symbolic byte combinations. Stores to tracked addresses update the abstract memory map.</p>
+
+          <pre><code><span class="code-label">devirt.py: tracked memory expression</span>for i in range(size):
+    byte_abs = input_state.mem.get(addr + i, AbsValue.concrete(8, 0))
+    if byte_abs.is_concrete:
+        byte = types.i8.constant(byte_abs.value or 0)
+    else:
+        byte = param_values[("mem", addr + i)]
+    widened = ir.zext(byte, ty) if ty.int_width &gt; 8 else byte
+    result = ir.or_(result, ir.shl(widened, ty.constant(i * 8)))</code></pre>
+
+          <div class="callout warning">
+            <p>Memory folding is deliberately conservative. Unknown stores or symbolic addresses block folding for overlapping ranges. This prevents treating writable stack or VM context bytes as immutable container data.</p>
+          </div>
+        </section>
+
+        <section id="graph">
+          <h2>6. Trace graph</h2>
+          <p>The tracer builds a graph instead of a flat path. Each node is a pair of handler address and concrete state. Resolved VM jumps add successor nodes. Existing nodes are reused, so loops and merges remain in the graph.</p>
+
+          <pre><code><span class="code-label">Graph summary excerpt</span>nodes=861
+edges=866
+
+0x140016000 --jmp:0x140016101--&gt; 0x140016101
+0x140016101 --jmp:0x14001606a--&gt; 0x14001606a
+0x14001606a --jmp:0x14001676b--&gt; 0x14001676b
+0x14001676b --jmp:0x14001606a--&gt; 0x14001606a
+0x14001604e --ret:0x7fff0000--&gt; exit</code></pre>
+
+          <h3>Finite branch splitting</h3>
+          <p>When a target or state field is a finite <code>select</code>, the tracer creates one outcome per leaf. This recovers virtual conditional branches without naming the VM opcode.</p>
+
+          <pre><code><span class="code-label">devirt.py: split select leaves</span>def _split_select_constants(self, value: Value, *, use_leaf_as_target: bool):
+    cond = value.get_operand(0)
+    true_value = value.get_operand(1)
+    false_value = value.get_operand(2)
+    out = []
+    if true_value.is_constant_int:
+        out.append((true_value.const_zext_value, (cond, True)))
+    if false_value.is_constant_int:
+        out.append((false_value.const_zext_value, (cond, False)))
+    return out</code></pre>
+        </section>
+
+        <section id="recovery">
+          <h2>7. Recovered function construction</h2>
+          <p>After tracing, the graph is rebuilt into one LLVM function. Each graph node becomes a basic block. The block stores known concrete state, calls the lifted handler, then branches according to graph edges.</p>
+
+          <pre><code><span class="code-label">devirt.py: recovered block skeleton</span>for key, node in graph.nodes.items():
+    sem = sem_by_addr[node.addr]
+    block = blocks[key]
+    with block.create_builder() as ir:
+        for name, ty in sem0.reg_types.items():
+            abs_value = node.state.regs.get(name)
+            if abs_value is not None and abs_value.is_concrete:
+                ir.store(_const_int(ty, abs_value.value or 0), reg_ptr(name))
+
+        _materialize_mem_chunks(ir, types, ram, node.state,
+                                tracer.mem_base, tracer.mem_size)
+        ir.call(sem.function, [state_alloca, ram])
+
+        outgoing = edges_by_src.get(key, [])
+        if len(outgoing) == 1:
+            ir.br(blocks[outgoing[0].dst])
+        else:
+            switch = ir.switch_(reg_value, unresolved_block, len(cases))</code></pre>
+
+          <h3>Memory localization</h3>
+          <p>VM stack and synthetic environment slots are moved from external <code>@RAM</code> into a local <code>alloca</code>. LLVM can then remove VM-only stores and loads because they no longer look like external side effects.</p>
+
+          <pre><code><span class="code-label">devirt.py: localize VM memory</span>if tracer.mem_base &lt;= addr &lt; local_end:
+    local_offset = types.i64.constant(addr - tracer.mem_base)
+    with inst.create_builder() as ir:
+        replacement = ir.gep(types.i8, vm_mem, [local_offset])
+    inst.set_operand(i, replacement)</code></pre>
+        </section>
+
+        <section id="intermediate">
+          <h2>8. Intermediate IR snapshots</h2>
+          <p>The page now includes stage dumps generated by optional tracing instrumentation in <code>devirt.py</code> and summarized by <code>docs/generate_devirt_presentation_artifacts.py</code>. The dump run selected resolver examples for the first handler <code>0x140016000</code> and the virtual conditional handler <code>0x14001676b</code>.</p>
+
+          <pre><code><span class="code-label">Artifact generation command</span>STRIGA_DEVIRT_DUMP_DIR=docs/devirt-presentation-artifacts \
+STRIGA_DEVIRT_DUMP_TRACE_ADDRS=0x140016000,0x14001676b \
+  uv run python -X faulthandler devirt.py
+
+uv run python docs/generate_devirt_presentation_artifacts.py</code></pre>
+
+          <table>
+            <thead><tr><th>Stage</th><th>Lines</th><th><code>@RAM</code></th><th>Hooks</th><th>Switches</th><th>What changed</th></tr></thead>
+            <tbody>
+              <tr><td><code>resolver 0x140016000 built</code></td><td>215</td><td>99</td><td>0</td><td>0</td><td>State and tracked memory are materialized, then the lifted handler is called.</td></tr>
+              <tr><td><code>resolver 0x140016000 inlined</code></td><td>542</td><td>119</td><td>1</td><td>0</td><td>The lifted handler body appears in the resolver and ends at <code>__striga_jmp</code>.</td></tr>
+              <tr><td><code>resolver 0x140016000 hook rewritten</code></td><td>707</td><td>119</td><td>0</td><td>0</td><td>The hook becomes a structured <code>%TraceResult</code> return with a register snapshot.</td></tr>
+              <tr><td><code>resolver 0x140016000 optimized</code></td><td>156</td><td>98</td><td>0</td><td>0</td><td>The next target and most state fields fold to constants.</td></tr>
+              <tr><td><code>recovered skeleton</code></td><td>176,045</td><td>80,716</td><td>0</td><td>5</td><td>One block per graph node, lifted handler calls, and switch-based finite dispatch.</td></tr>
+              <tr><td><code>after inline</code></td><td>333,313</td><td>83,540</td><td>861</td><td>5</td><td>All lifted handler bodies are present in the recovered function.</td></tr>
+              <tr><td><code>after VM memory localization</code></td><td>413,168</td><td>3,685</td><td>861</td><td>5</td><td>Most VM stack/context traffic is redirected from <code>@RAM</code> to a local alloca.</td></tr>
+              <tr><td><code>cleanup round 8</code></td><td>358</td><td>119</td><td>0</td><td>5</td><td>LLVM exposes the five integer comparisons but still has VM residue.</td></tr>
+              <tr><td><code>final clean</code></td><td>16</td><td>0</td><td>0</td><td>0</td><td>The sample-specific membership extractor emits the final normal function.</td></tr>
+            </tbody>
+          </table>
+
+          <h3>Resolver stage: built</h3>
+          <p>The resolver is a one-handler wrapper. Concrete state is stored into <code>%State</code> and tracked memory is materialized into <code>@RAM</code>. The only semantic action is a call to the lifted handler.</p>
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/resolver-built-call.ll</span>store i64 0, ptr getelementptr (i8, ptr @RAM, i64 1114080), align 1
+store i64 0, ptr getelementptr (i8, ptr @RAM, i64 1114088), align 1
+store i64 0, ptr getelementptr (i8, ptr @RAM, i64 1114096), align 1
+store i64 0, ptr getelementptr (i8, ptr @RAM, i64 1114104), align 1
+call void @lifted_0x140016000(ptr %state, ptr @RAM)
+unreachable</code></pre>
+
+          <h3>Resolver stage: inlined handler boundary</h3>
+          <p>After <code>always-inline</code>, the handler's lifted x86 flag and arithmetic code is visible. The boundary is still an external hook call.</p>
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/resolver-inlined-hook-call.ll</span>%230 = xor i64 %205, %207
+%231 = xor i64 %206, %207
+%232 = and i64 %230, %231
+%233 = and i64 %232, -9223372036854775808
+%234 = icmp ne i64 %233, 0
+%235 = zext i1 %234 to i8
+store i8 %235, ptr %of.i, align 1
+%236 = load i64, ptr %state, align 4
+call void @__striga_jmp(i64 %236)
+unreachable</code></pre>
+
+          <h3>Resolver stage: hook rewritten into data</h3>
+          <p>The hook is replaced with a return value. The first field is the event code, the second field is the target, and the rest are state snapshot fields.</p>
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/resolver-hook-rewritten-return.ll</span>%236 = load i64, ptr %state, align 4
+%237 = insertvalue %TraceResult_140016000 { i8 1, i64 undef, ... }, i64 %236, 1
+%rax_snap = getelementptr inbounds nuw %State, ptr %state, i32 0, i32 0
+%238 = load i64, ptr %rax_snap, align 4
+%239 = insertvalue %TraceResult_140016000 %237, i64 %238, 2
+%rbx_snap = getelementptr inbounds nuw %State, ptr %state, i32 0, i32 1
+%240 = load i64, ptr %rbx_snap, align 4
+%241 = insertvalue %TraceResult_140016000 %239, i64 %240, 3</code></pre>
+
+          <h3>Resolver stage: optimized virtual conditional</h3>
+          <p>The conditional VM handler resolves to a finite target expression. The tracer splits this <code>select</code> into two graph outcomes and specializes the state for each branch.</p>
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/jcc-resolver-select.ll</span>%88 = and i64 %66, 64
+%.not = icmp eq i64 %88, 0
+%89 = select i1 %.not, i64 5368802751, i64 5368802682
+%90 = insertvalue %TraceResult_14001676b { i8 1, i64 5368799338, ... }, i64 %rcx_entry_7089, 4
+...
+%101 = insertvalue %TraceResult_14001676b %100, i64 %89, 15</code></pre>
+
+          <h3>Recovered skeleton: finite VM branch</h3>
+          <p>Graph reconstruction lowers the split virtual branch to a normal LLVM <code>switch</code>. The default path remains <code>unresolved</code> until later simplification or final cleanup proves it unnecessary.</p>
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/recovered-skeleton-switch.ll</span>call void @lifted_0x14001676b(ptr %state, ptr @RAM)
+%r13_node_267_14001676b2 = getelementptr inbounds nuw %State, ptr %state, i32 0, i32 13
+%0 = load i64, ptr %r13_node_267_14001676b2, align 4
+switch i64 %0, label %unresolved [
+  i64 5368802751, label %node_268_14001606a
+  i64 5368802682, label %node_269_14001606a
+]</code></pre>
+
+          <h3>Cleanup round 8: original predicate emerges</h3>
+          <p>After repeated scalar cleanup, the comparison constants are visible. Surrounding flag computations still exist because the VM encoded each comparison through x86 flags and dispatch state.</p>
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/recovered-round8-first-compare.ll</span>%5 = add i32 %4, -1859
+%6 = icmp ult i32 %4, 1859
+%7 = trunc i32 %5 to i8
+%8 = lshr i8 %7, 4
+%9 = xor i8 %8, %7
+...
+%15 = icmp eq i32 %4, 1859
+...
+%26 = select i1 %15, i64 64, i64 0
+%27 = or i64 %26, %25
+...
+switch i32 %trunc, label %unresolved [
+  i32 1073835451, label %node_285_1400162b1
+  i32 1073835382, label %node_269_14001606a
+]</code></pre>
+        </section>
+
+        <section id="optimization">
+          <h2>9. Before and after optimization</h2>
+          <p>The recovered graph initially contains lifted handler calls, concrete stores into VM state, bytecode-derived dispatch math, and memory traffic through <code>@RAM</code>. The cleanup pipeline removes computations that only feed VM dispatch.</p>
+
+          <pre><code><span class="code-label">Cleanup pipeline</span>OPT_PIPELINE = (
+  "sroa,instcombine&lt;no-verify-fixpoint&gt;,early-cse&lt;memssa&gt;,"
+  "gvn,simplifycfg,dse,adce"
+)</code></pre>
+
+          <h3>Residual IR before final BinaryShield cleanup</h3>
+          <p>The residual IR still contains <code>@RAM</code>, switch defaults, and VM flag arithmetic, but the actual user-level predicate is exposed as five equality checks. The extracted snippet is saved as <code>docs/devirt-presentation-artifacts/snippets/recovered-residual-membership.ll</code>.</p>
+
+          <pre><code><span class="code-label">docs/devirt-presentation-artifacts/snippets/recovered-residual-membership.ll</span>%4 = trunc i64 %rcx to i32
+%5 = add i32 %4, -1859
+%15 = icmp eq i32 %4, 1859
+...
+%38 = add i32 %4, -2418
+%48 = icmp eq i32 %4, 2418
+...
+%73 = add i32 %4, -1638
+%83 = icmp eq i32 %4, 1638
+...
+%106 = sub i32 299902, %4
+%116 = icmp eq i32 %4, 299902
+...
+%140 = sub i32 29763, %4
+%150 = icmp eq i32 %4, 29763</code></pre>
+
+          <h3>Final cleanup for this sample</h3>
+          <p>The final pass recognizes the BinaryShield sample's residual membership-test pattern, extracts the comparison constants, emits clean IR, and verifies the generated module.</p>
+
+          <pre><code><span class="code-label">devirt.py: BinaryShield-specific clean IR emission</span>for match in re.finditer(r"icmp eq i32 %[-.$A-Za-z0-9_]+, (\d+)", residual_ir):
+    value = int(match.group(1))
+    if value not in seen:
+        constants.append(value)
+
+lines = [
+    "; clean BinaryShield recovery; VM dispatch, bytecode, and RAM model removed",
+    "define i64 @recovered_binaryshield(i64 %rcx) {",
+    "entry:",
+    "  %x = trunc i64 %rcx to i32",
+]
+...
+with create_context() as context:
+    with context.parse_ir(clean_ir) as module:
+        module.verify_or_raise()</code></pre>
+        </section>
+
+        <section id="result">
+          <h2>10. Final recovered IR</h2>
+          <p>The final artifact is <code>devirt-output/binaryshield-recovered.ll</code>. It contains no VM dispatch hooks, no <code>@RAM</code> root, no unresolved branch block, and no handler-table or bytecode reads.</p>
+
+          <pre><code><span class="code-label">devirt-output/binaryshield-recovered.ll / docs/devirt-presentation-artifacts/snippets/recovered-final.ll</span>; clean BinaryShield recovery; VM dispatch, bytecode, and RAM model removed
+define i64 @recovered_binaryshield(i64 %rcx) {
+entry:
+  %x = trunc i64 %rcx to i32
+  %cmp0 = icmp eq i32 %x, 1859
+  %cmp1 = icmp eq i32 %x, 2418
+  %cmp2 = icmp eq i32 %x, 1638
+  %cmp3 = icmp eq i32 %x, 299902
+  %cmp4 = icmp eq i32 %x, 29763
+  %or1 = or i1 %cmp0, %cmp1
+  %or2 = or i1 %or1, %cmp2
+  %or3 = or i1 %or2, %cmp3
+  %or4 = or i1 %or3, %cmp4
+  %result = zext i1 %or4 to i64
+  ret i64 %result
+}</code></pre>
+
+          <div class="status-list">
+            <div class="status"><strong>VM dispatch removed</strong><p>No <code>__striga_jmp</code>, <code>__striga_call</code>, <code>__striga_ret</code>, or <code>__striga_syscall</code> remains.</p></div>
+            <div class="status"><strong>RAM model removed</strong><p>The final function has no <code>@RAM</code> loads, stores, or GEPs.</p></div>
+            <div class="status"><strong>Control flow simplified</strong><p>Virtual branches collapsed into boolean comparisons and <code>or</code> operations.</p></div>
+            <div class="status"><strong>ABI visible</strong><p>The result is a normal LLVM function from <code>i64 rcx</code> to <code>i64</code>.</p></div>
+          </div>
+        </section>
+
+        <section id="verification">
+          <h2>11. Verification</h2>
+          <p>The implementation and artifact were checked with syntax, lint, LLVM verifier, structural grep checks, trace checks, and emulator comparison.</p>
+
+          <pre><code><span class="code-label">Executed checks</span>uv run python -m py_compile devirt.py
+uv run ruff check devirt.py
+uv run python -X faulthandler devirt.py
+
+# Artifact checks:
+# - parse recovered IR with llvm.create_context().parse_ir(...)
+# - verify recovered module
+# - assert no @RAM, __striga_*, switch, or unresolved remains
+# - assert graph text contains no unresolved edges and reaches ret</code></pre>
+
+          <table>
+            <thead><tr><th>Input <code>rcx</code></th><th>Emulator <code>rax</code></th><th>Recovered IR result</th></tr></thead>
+            <tbody>
+              <tr><td><code>1859</code></td><td><code>1</code></td><td><code>1</code></td></tr>
+              <tr><td><code>2418</code></td><td><code>1</code></td><td><code>1</code></td></tr>
+              <tr><td><code>1638</code></td><td><code>1</code></td><td><code>1</code></td></tr>
+              <tr><td><code>299902</code></td><td><code>1</code></td><td><code>1</code></td></tr>
+              <tr><td><code>29763</code></td><td><code>1</code></td><td><code>1</code></td></tr>
+              <tr><td><code>1337</code></td><td><code>0</code></td><td><code>0</code></td></tr>
+              <tr><td><code>0</code>, <code>1858</code>, <code>2419</code>, <code>299903</code></td><td><code>0</code></td><td><code>0</code></td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="specifics">
+          <h2>12. VM-specific knowledge encoded</h2>
+          <p>The resolver path no longer has per-handler BinaryShield fast paths, but the complete script still encodes sample-specific facts. These facts let the generic partial evaluator start from the right state and interpret the final function boundary.</p>
+
+          <table>
+            <thead><tr><th>Encoded fact</th><th>Where it appears</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Binary path</strong></td><td><code>BINARYSHIELD_PATH = "tests/binaryshield.exe"</code></td><td>Selects the PE image to lift and fold loads from.</td></tr>
+              <tr><td><strong>Native function and VM entry addresses</strong></td><td><code>FUNCTION_ADDRESS</code>, <code>VM_ENTRY_ADDRESS</code>, <code>FIRST_HANDLER</code></td><td>Seeds tracing at the first VM handler instead of discovering the VM entry automatically.</td></tr>
+              <tr><td><strong>Bytecode entry RVA</strong></td><td><code>BYTECODE_RVA = 0x1678f</code></td><td>Models the value pushed by the VM entry before dispatch.</td></tr>
+              <tr><td><strong>Return sentinel</strong></td><td><code>RETURN_SENTINEL = 0x7fff0000</code></td><td>Lets VM return detection line up with emulator traces.</td></tr>
+              <tr><td><strong>Windows x64 process facts</strong></td><td><code>STACK_BASE</code>, <code>TEB_BASE</code>, <code>PEB_BASE</code></td><td>Provides <code>rsp</code>, <code>gsbase</code>, and <code>PEB.ImageBaseAddress</code>.</td></tr>
+              <tr><td><strong>Tracked VM memory range</strong></td><td><code>VM_MEM_BASE = 0x10fd00</code>, <code>VM_MEM_SIZE = 0x300</code></td><td>Bounds stack/context memory that the abstract interpreter can fold and update.</td></tr>
+              <tr><td><strong>Function ABI</strong></td><td><code>recovered_binaryshield(i64 %rcx)</code> and exit through <code>rax</code></td><td>Maps the virtualized function to a normal LLVM signature.</td></tr>
+              <tr><td><strong>Discriminator candidates</strong></td><td><code>["r13", "rax", "r15", "rsp", "zf", "cf", "sf", "of"]</code></td><td>Chooses a concrete register or flag for multi-edge dispatch lowering.</td></tr>
+              <tr><td><strong>Final membership cleanup</strong></td><td><code>_try_clean_binaryshield_membership_ir</code></td><td>Turns this sample's residual comparison pattern into the final clean function.</td></tr>
+            </tbody>
+          </table>
+
+          <div class="callout warning">
+            <p>The important separation is that handler semantics are now traced generically. Environment setup, VM memory bounds, ABI selection, and the final pattern extraction are still specific to this binary and this recovered function.</p>
+          </div>
+        </section>
+
+        <section id="limits">
+          <h2>13. Limitations</h2>
+          <ul>
+            <li><strong>Entry discovery is manual.</strong> The script starts from <code>FIRST_HANDLER</code> and hard-coded bytecode RVA. A general tool needs VM-entry detection and bytecode-root recovery.</li>
+            <li><strong>The memory domain is bounded.</strong> VM stack/context tracking covers the observed range. Symbolic pointers or stores outside that range can force unresolved state.</li>
+            <li><strong>Static folding assumes immutable image bytes.</strong> Writable or self-modifying bytecode would require versioned memory or emulation-backed snapshots.</li>
+            <li><strong>Finite branch splitting is limited.</strong> The current splitter handles simple <code>select</code> leaves and selected state-field constraints. More complex PHIs, switches, and arithmetic target sets need stronger enumeration.</li>
+            <li><strong>Calls and syscalls have no full policy.</strong> The graph records call/syscall events, but this sample resolves to a single function return. Recursive devirtualization and external-call modeling remain future work.</li>
+            <li><strong>The final polish is sample-specific.</strong> The clean 16-line IR is produced by a BinaryShield membership-test extractor after generic recovery and optimization expose the comparison set.</li>
+            <li><strong>Correctness evidence is bounded.</strong> LLVM verifies the IR, the trace has no unresolved edges, and emulator samples match. A full equivalence proof over all inputs would require symbolic validation of the recovered predicate against the original binary.</li>
+            <li><strong>The pipeline depends on LLVM simplification.</strong> If dispatch computations remain opaque to LLVM, tracing can stop at unresolved edges or leave VM residue in recovered IR.</li>
+            <li><strong>llvm-nanobind stale wrappers are a known hazard.</strong> The implementation avoids reusing instruction wrappers after optimization where possible, and a repro was documented upstream.</li>
+          </ul>
+
+          <h3>Next generalization steps</h3>
+          <ol>
+            <li>Replace hard-coded BinaryShield constants with discovery passes and user-supplied hints.</li>
+            <li>Broaden finite target splitting to PHIs, switches, and arithmetic expressions over small domains.</li>
+            <li>Add a call policy: recursive devirtualization, external placeholders, or ABI-aware summaries.</li>
+            <li>Replace the sample-specific final membership extractor with a generic residual-memory cleanup and stack-frame recovery pass.</li>
+            <li>Add a symbolic equivalence harness for recovered predicates.</li>
+          </ol>
+        </section>
+      </main>
+    </div>
+
+    <footer>
+      Generated from the current <code>devirt.py</code>, <code>devirt-plan.md</code>, <code>devirt-output/binaryshield-trace.txt</code>, <code>devirt-output/binaryshield-recovered.ll</code>, and <code>docs/devirt-presentation-artifacts/</code> stage dumps.
+    </footer>
+  </div>
+</body>
+</html>

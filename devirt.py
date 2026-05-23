@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,19 @@ LOCAL_MEM_SIZE = (PEB_BASE + 0x18) - VM_MEM_BASE
 OPT_PIPELINE = "sroa,instcombine<no-verify-fixpoint>,early-cse<memssa>,gvn,simplifycfg,dse,adce"
 MAX_TRACE_NODES = 2000
 MAX_FOLD_ROUNDS = 8
+DUMP_DIR_ENV = "STRIGA_DEVIRT_DUMP_DIR"
+DUMP_TRACE_ADDRS_ENV = "STRIGA_DEVIRT_DUMP_TRACE_ADDRS"
+
+
+def _parse_addr_set(text: str | None) -> set[int]:
+    if not text:
+        return set()
+    addrs: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if part:
+            addrs.add(int(part, 0))
+    return addrs
 
 
 @dataclass(frozen=True)
@@ -131,10 +145,25 @@ class HandlerTracer:
         self.mem_base = mem_base
         self.mem_size = mem_size
         self.namer = SymbolNamer()
+        dump_dir = os.environ.get(DUMP_DIR_ENV)
+        self.dump_dir = Path(dump_dir) if dump_dir else None
+        self.dump_trace_addrs = _parse_addr_set(os.environ.get(DUMP_TRACE_ADDRS_ENV))
+        self._dumped_resolver_stages: set[tuple[int, str]] = set()
 
     @property
     def mem_end(self) -> int:
         return self.mem_base + self.mem_size
+
+    def _dump_resolver(self, addr: int, stage: str, resolver: Value) -> None:
+        if self.dump_dir is None or addr not in self.dump_trace_addrs:
+            return
+        key = (addr, stage)
+        if key in self._dumped_resolver_stages:
+            return
+        self._dumped_resolver_stages.add(key)
+        out_dir = self.dump_dir / "resolvers"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"{addr:x}-{stage}.ll").write_text(str(resolver) + "\n", encoding="utf-8")
 
     def initial_state(self, *, symbolic_rcx: bool = True, rcx_value: int = 0) -> TraceState:
         with create_context() as context:
@@ -235,9 +264,12 @@ class HandlerTracer:
                     ir.call(sem.function, [state_alloca, ram])
                     ir.unreachable()
 
+                self._dump_resolver(addr, "01-built", resolver)
                 module.verify_or_raise()
                 module.optimize("always-inline")
+                self._dump_resolver(addr, "02-inlined-before-hook-rewrite", resolver)
                 self._rewrite_hooks(module, resolver, sem, state_alloca, ram, result_ty)
+                self._dump_resolver(addr, "03-hook-rewritten", resolver)
                 module.verify_or_raise()
 
                 for _ in range(MAX_FOLD_ROUNDS):
@@ -246,6 +278,7 @@ class HandlerTracer:
                     module.verify_or_raise()
                 module.optimize(OPT_PIPELINE)
                 module.verify_or_raise()
+                self._dump_resolver(addr, "04-optimized", resolver)
 
                 return self._read_outcomes(resolver, sem, result_ty, ram, state)
 
@@ -742,6 +775,15 @@ def _materialize_mem_chunks(ir, types, ram: Value, state: TraceState, mem_base: 
         store.inst_alignment = 1
 
 
+def _dump_recovered_stage(tracer: HandlerTracer, stage: str, recovered: Value | str) -> None:
+    if tracer.dump_dir is None:
+        return
+    out_dir = tracer.dump_dir / "recovered"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text = recovered if isinstance(recovered, str) else str(recovered) + "\n"
+    (out_dir / f"{stage}.ll").write_text(text, encoding="utf-8")
+
+
 def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer, output_path: Path) -> None:
     with create_context() as context:
         types = context.types
@@ -854,24 +896,29 @@ def recover_ir(container: PEContainer, graph: TraceGraph, tracer: HandlerTracer,
             for hook in ("__striga_jmp", "__striga_call", "__striga_ret", "__striga_syscall"):
                 _define_noop_hook(module, hook)
 
+            _dump_recovered_stage(tracer, "01-skeleton-before-inline", recovered)
             module.verify_or_raise()
             module.optimize("always-inline")
+            _dump_recovered_stage(tracer, "02-after-inline", recovered)
             # Do this before scalar optimization. LLVM may erase or rewrite
             # instruction values during optimize(); reusing stale Python Value
             # wrappers after that can currently crash llvm-nanobind.
             localize_vm_memory(recovered, ram, vm_mem, tracer, mem_size=LOCAL_MEM_SIZE)
+            _dump_recovered_stage(tracer, "03-after-vm-memory-localization", recovered)
             module.verify_or_raise()
-            for _ in range(MAX_FOLD_ROUNDS):
+            for i in range(MAX_FOLD_ROUNDS):
                 module.optimize(OPT_PIPELINE)
                 fold_static_image_loads(recovered, ram, tracer)
+                if i in {0, MAX_FOLD_ROUNDS - 1}:
+                    _dump_recovered_stage(tracer, f"04-cleanup-round-{i + 1}", recovered)
                 module.verify_or_raise()
             module.optimize("default<O2>")
             module.verify_or_raise()
             residual_ir = str(recovered) + "\n"
-            output_path.write_text(
-                _try_clean_binaryshield_membership_ir(residual_ir) or residual_ir,
-                encoding="utf-8",
-            )
+            _dump_recovered_stage(tracer, "05-residual-before-final-pattern-cleanup", residual_ir)
+            clean_ir = _try_clean_binaryshield_membership_ir(residual_ir) or residual_ir
+            _dump_recovered_stage(tracer, "06-final-clean", clean_ir)
+            output_path.write_text(clean_ir, encoding="utf-8")
 
 
 def _choose_discriminator(
