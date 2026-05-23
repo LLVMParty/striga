@@ -12,12 +12,45 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from capstone import CS_GRP_CALL
+from capstone import CS_GRP_CALL, CS_GRP_JUMP, CS_OP_IMM, CS_OP_MEM, CsInsn
+from capstone.x86_const import X86_REG_RIP
 from llvm import BasicBlock, Function, IntPredicate, Opcode, Value, create_context
 
 from container import PEContainer
 from striga import Semantics
 from tools.bright_step import call_name, parse_assignment, parse_int
+
+
+SeedKind = Literal[
+    "imm",
+    "push_imm",
+    "mov_imm",
+    "lea_addr",
+    "call_return",
+    "image_backing",
+    "overlay_store",
+    "control_load",
+]
+CONTROL_SEED_KINDS: frozenset[SeedKind] = frozenset(
+    {
+        "push_imm",
+        "mov_imm",
+        "lea_addr",
+        "call_return",
+        "image_backing",
+        "overlay_store",
+        "control_load",
+    }
+)
+
+
+@dataclass(frozen=True)
+class Seed:
+    kind: SeedKind
+    insn_addr: int
+    value: int
+    detail: str
+    source_addr: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +80,7 @@ class SymVal:
     width: int | None
     address: Address | None = None
     unknowns: tuple[str, ...] = ()
+    deps: frozenset[str] = frozenset()
     xor_symbols: frozenset[str] = frozenset()
     xor_address: Address | None = None
     xor_const: int = 0
@@ -67,6 +101,7 @@ class SymVal:
             width,
             address,
             self.unknowns,
+            self.deps,
             xor_symbols,
             xor_address,
             xor_const,
@@ -120,7 +155,8 @@ class MemoryKey:
 @dataclass
 class MemoryModel:
     container: PEContainer
-    zero_unknown_abs: bool = True
+    seeds: list[Seed]
+    zero_unknown_abs: bool = False
     exact: dict[tuple[MemoryKey, int], SymVal] = field(default_factory=dict)
     bytes: dict[MemoryKey, SymVal] = field(default_factory=dict)
 
@@ -131,7 +167,7 @@ class MemoryModel:
             return MemoryKey("abs", offset.concrete)
         return None
 
-    def read(self, offset: SymVal, width: int) -> SymVal:
+    def read(self, offset: SymVal, width: int, *, insn_addr: int = 0) -> SymVal:
         key = self.key_from_offset(offset)
         if key is None:
             return SymVal.unknown(f"load_i{width}({offset.text})", width)
@@ -143,50 +179,143 @@ class MemoryModel:
         exact = self.exact.get((key, width))
         if exact is not None:
             return exact.with_width(width)
+        covered = self._read_covering_exact(key, width)
+        if covered is not None:
+            return covered
 
         byte_width = width // 8
         parts = [self.bytes.get(key.add(i)) for i in range(byte_width)]
         if all(part is not None and part.concrete is not None for part in parts):
             concrete = 0
             texts: list[str] = []
+            deps: frozenset[str] = frozenset()
             for i, part in enumerate(parts):
                 assert part is not None and part.concrete is not None
                 concrete |= (part.concrete & 0xFF) << (i * 8)
                 texts.append(part.text)
-            text = format_int(concrete) if len(set(texts)) == 1 else "concat_le(" + ", ".join(texts) + ")"
-            return SymVal.const(mask_value(concrete, width), width, text)
+                deps = deps | part.deps
+            text = format_int(concrete) if not deps and len(set(texts)) == 1 else "concat_le(" + ", ".join(texts) + ")"
+            return SymVal(
+                text,
+                mask_value(concrete, width),
+                width,
+                deps=deps,
+                xor_const=mask_value(concrete, width),
+            )
 
         if key.base == "abs":
             if self.container.in_range(key.offset) and self.container.in_range(key.offset + byte_width - 1):
                 data = self.container.get_data(key.offset, byte_width)
                 value = int.from_bytes(data, "little")
-                return SymVal.const(value, width, f"{value:#x}/*image@{key.offset:#x}*/")
+                seed = Seed(
+                    "image_backing",
+                    insn_addr,
+                    value,
+                    f"read i{width} from initial image {key.offset:#x}; addr_expr={offset.text}",
+                    key.offset,
+                )
+                add_seed(self.seeds, seed)
+                marker = seed_marker(seed)
+                return SymVal(
+                    f"{value:#x}/*{marker}*/{{addr={offset.text}}}",
+                    mask_value(value, width),
+                    width,
+                    deps=offset.deps | frozenset({marker}),
+                    xor_const=mask_value(value, width),
+                )
             if self.zero_unknown_abs:
                 return SymVal.const(0, width, f"0/*zero_uninit@{key.offset:#x}*/")
 
         return SymVal.unknown(f"load_i{width}({key.text()})", width)
 
-    def write(self, offset: SymVal, value: SymVal) -> None:
+    def write(self, offset: SymVal, value: SymVal, *, insn_addr: int = 0) -> None:
         key = self.key_from_offset(offset)
         width = value.width
         if key is None or width is None or width % 8:
             return
         byte_width = width // 8
         self._remove_overlapping_exact(key, byte_width)
-        stored = value.with_width(width)
+        stored = self._annotate_overlay_store(key, value.with_width(width), insn_addr)
         self.exact[(key, width)] = stored
         for i in range(byte_width):
             byte_key = key.add(i)
             if stored.concrete is not None:
                 byte = (stored.concrete >> (i * 8)) & 0xFF
-                self.bytes[byte_key] = SymVal.const(byte, 8, f"{byte:#x}")
+                text = f"byte{i}({stored.text})" if stored.deps else f"{byte:#x}"
+                self.bytes[byte_key] = SymVal(
+                    text,
+                    byte,
+                    8,
+                    unknowns=stored.unknowns,
+                    deps=stored.deps,
+                    xor_const=byte,
+                )
             else:
                 self.bytes[byte_key] = SymVal(
                     f"byte{i}({stored.text})",
                     None,
                     8,
                     unknowns=stored.unknowns,
+                    deps=stored.deps,
                 )
+
+    def _annotate_overlay_store(
+        self, key: MemoryKey, value: SymVal, insn_addr: int
+    ) -> SymVal:
+        if key.base != "abs" or insn_addr == 0 or value.concrete is None:
+            return value
+        seed = Seed(
+            "overlay_store",
+            insn_addr,
+            value.concrete,
+            f"store i{value.width} to memory {key.offset:#x}; value_expr={value.text}",
+            key.offset,
+        )
+        add_seed(self.seeds, seed)
+        marker = seed_marker(seed)
+        if marker in value.text:
+            return value
+        return SymVal(
+            f"overlay_store[{key.offset:#x}]({value.text})/*{marker}*/",
+            value.concrete,
+            value.width,
+            value.address,
+            value.unknowns,
+            value.deps | frozenset({marker}),
+            value.xor_symbols,
+            value.xor_address,
+            value.xor_const,
+        )
+
+    def _read_covering_exact(self, key: MemoryKey, width: int) -> SymVal | None:
+        byte_width = width // 8
+        for (exact_key, exact_width), exact in self.exact.items():
+            if exact_key.base != key.base:
+                continue
+            exact_byte_width = exact_width // 8
+            start = key.offset
+            end = start + byte_width
+            exact_start = exact_key.offset
+            exact_end = exact_start + exact_byte_width
+            if not (exact_start <= start and end <= exact_end):
+                continue
+            shift = (start - exact_start) * 8
+            concrete = None
+            if exact.concrete is not None:
+                concrete = mask_value(exact.concrete >> shift, width)
+            if shift:
+                text = f"trunc(({exact.text} >>> {format_int(shift)}) -> i{width})"
+            else:
+                text = f"trunc({exact.text} -> i{width})"
+            return SymVal(
+                text,
+                concrete,
+                width,
+                unknowns=exact.unknowns,
+                deps=exact.deps,
+                xor_const=mask_value(exact.xor_const >> shift, width),
+            )
+        return None
 
     def _remove_overlapping_exact(self, key: MemoryKey, byte_width: int) -> None:
         to_delete: list[tuple[MemoryKey, int]] = []
@@ -217,6 +346,7 @@ class MemoryModel:
 class ExecutionState:
     regs: dict[str, SymVal]
     memory: MemoryModel
+    seeds: list[Seed]
     locals: dict[int, SymVal | PtrVal] = field(default_factory=dict)
     boundary_call: str | None = None
     boundary_value: SymVal | None = None
@@ -245,6 +375,7 @@ class ConcolicResult:
     steps: int
     trace: list[str]
     module_text: str
+    seeds: list[Seed]
 
 
 def format_int(value: int) -> str:
@@ -281,6 +412,69 @@ def parse_int_set(items: list[int]) -> set[int]:
     return set(items)
 
 
+def seed_marker(seed: Seed) -> str:
+    marker = f"{seed.kind}@{seed.insn_addr:#x}"
+    if seed.source_addr is not None:
+        marker = f"{marker}:{seed.source_addr:#x}"
+    return marker
+
+
+def add_seed(seeds: list[Seed], seed: Seed) -> None:
+    key = (seed.kind, seed.insn_addr, mask_value(seed.value, 64), seed.detail, seed.source_addr)
+    if any(
+        (item.kind, item.insn_addr, mask_value(item.value, 64), item.detail, item.source_addr) == key
+        for item in seeds
+    ):
+        return
+    seeds.append(seed)
+
+
+def instruction_address_from_metadata(inst: Value) -> int | None:
+    name = inst.name
+    if name.startswith("mem_read_"):
+        token = name.removeprefix("mem_read_").split(".", 1)[0]
+        try:
+            return int(token, 16)
+        except ValueError:
+            pass
+    md = inst.metadata.get("striga.insn")
+    if md is None or not md.is_node:
+        return None
+    operands = md.operands
+    if not operands or not operands[0].is_string:
+        return None
+    return int(operands[0].string, 0)
+
+
+def annotate_value_with_instruction_seed(
+    value: SymVal, insn_addr: int | None, seeds: list[Seed]
+) -> SymVal:
+    if insn_addr is None or value.concrete is None:
+        return value
+    for seed in seeds:
+        if seed.kind not in CONTROL_SEED_KINDS:
+            continue
+        if seed.insn_addr != insn_addr:
+            continue
+        if mask_value(seed.value, value.width) != mask_value(value.concrete, value.width):
+            continue
+        marker = seed_marker(seed)
+        if marker in value.text:
+            return value
+        return SymVal(
+            f"{format_int(value.concrete)}/*{marker}*/",
+            value.concrete,
+            value.width,
+            value.address,
+            value.unknowns,
+            value.deps | frozenset({marker}),
+            value.xor_symbols,
+            value.xor_address,
+            value.xor_const,
+        )
+    return value
+
+
 class LLVMConcolicExecutor:
     def __init__(self, container: PEContainer, cfg: ConcolicConfig):
         self.container = container
@@ -302,6 +496,7 @@ class LLVMConcolicExecutor:
                     code = self.container.get_data(rip, 15)
                     insn = sem.cs_disasm(rip, code)
                     instruction = f"{insn.mnemonic} {insn.op_str}".strip()
+                    self._record_seed_candidates(insn, state)
                     if len(self.trace) < self.cfg.trace_limit:
                         self.trace.append(f"{rip:#x}: {instruction}")
 
@@ -335,6 +530,7 @@ class LLVMConcolicExecutor:
                     state.steps,
                     self.trace,
                     str(module),
+                    state.seeds,
                 )
                 self._write_outputs(result)
                 return result
@@ -351,9 +547,40 @@ class LLVMConcolicExecutor:
                 regs[name] = SymVal.env("teb", width)
             else:
                 regs[name] = SymVal.unknown(f"source_{name}()", width)
-        return ExecutionState(regs, MemoryModel(self.container, self.cfg.zero_unknown_abs))
+        seeds: list[Seed] = []
+        return ExecutionState(
+            regs,
+            MemoryModel(self.container, seeds, self.cfg.zero_unknown_abs),
+            seeds,
+        )
 
-    def _lift_followed_call(self, sem: Semantics, insn) -> None:
+    def _record_seed_candidates(self, insn, state: ExecutionState) -> None:
+        for op in insn.operands:
+            if op.type == CS_OP_IMM:
+                if insn.mnemonic == "call":
+                    add_seed(
+                        state.seeds,
+                        Seed(
+                            "call_return",
+                            insn.address,
+                            insn.address + insn.size,
+                            f"call return {insn.address + insn.size:#x}",
+                        ),
+                    )
+                    continue
+                if insn.group(CS_GRP_JUMP):
+                    continue
+                kind: SeedKind = "imm"
+                if insn.mnemonic == "push":
+                    kind = "push_imm"
+                elif insn.mnemonic in {"mov", "movabs"}:
+                    kind = "mov_imm"
+                add_seed(state.seeds, Seed(kind, insn.address, op.imm, f"{insn.mnemonic} {insn.op_str}"))
+            elif op.type == CS_OP_MEM and insn.mnemonic == "lea" and op.mem.base == X86_REG_RIP:
+                addr = insn.address + insn.size + op.mem.disp
+                add_seed(state.seeds, Seed("lea_addr", insn.address, addr, f"lea {insn.op_str}"))
+
+    def _lift_followed_call(self, sem: Semantics, insn: CsInsn) -> None:
         block = sem.get_or_create_block(insn.address)
         if block.first_instruction is not None and block.first_instruction.opcode == Opcode.Ret:
             block.first_instruction.erase_from_parent()
@@ -403,12 +630,20 @@ class LLVMConcolicExecutor:
     ) -> None:
         op = inst.opcode
         if op == Opcode.Store:
-            value = self._eval_value(inst.get_operand(0), state)
+            value = annotate_value_with_instruction_seed(
+                self._eval_value(inst.get_operand(0), state),
+                instruction_address_from_metadata(inst),
+                state.seeds,
+            )
             ptr = self._eval_pointer(inst.get_operand(1), state)
             if ptr.kind == "state" and ptr.reg is not None:
                 state.regs[ptr.reg] = value.with_width(state.regs[ptr.reg].width)
             elif ptr.kind == "memory" and ptr.offset is not None:
-                state.memory.write(ptr.offset.with_width(64), value)
+                state.memory.write(
+                    ptr.offset.with_width(64),
+                    value,
+                    insn_addr=instruction_address_from_metadata(inst) or 0,
+                )
             return
         if op == Opcode.Call:
             self._eval_call(inst, state)
@@ -444,7 +679,11 @@ class LLVMConcolicExecutor:
             if ptr.kind == "state" and ptr.reg is not None:
                 return state.regs[ptr.reg].with_width(width)
             if ptr.kind == "memory" and ptr.offset is not None and width is not None:
-                return state.memory.read(ptr.offset.with_width(64), width)
+                return state.memory.read(
+                    ptr.offset.with_width(64),
+                    width,
+                    insn_addr=instruction_address_from_metadata(value) or 0,
+                )
             return SymVal.unknown(f"load({ptr.text()})", width)
         if op == Opcode.Call:
             return self._eval_call(value, state)
@@ -454,7 +693,14 @@ class LLVMConcolicExecutor:
             inner = self._eval_value(value.get_operand(0), state)
             if op == Opcode.Trunc:
                 concrete = None if inner.concrete is None else mask_value(inner.concrete, width)
-                return SymVal(cast_text("trunc", inner.text, width), concrete, width, unknowns=inner.unknowns)
+                return SymVal(
+                    cast_text("trunc", inner.text, width),
+                    concrete,
+                    width,
+                    unknowns=inner.unknowns,
+                    deps=inner.deps,
+                    xor_const=mask_value(inner.xor_const, width),
+                )
             return inner.with_width(width, signed=op == Opcode.SExt)
         if op == Opcode.ICmp:
             return self._eval_icmp(value, state)
@@ -470,6 +716,7 @@ class LLVMConcolicExecutor:
                 concrete,
                 width,
                 unknowns=(*cond.unknowns, *true_value.unknowns, *false_value.unknowns),
+                deps=cond.deps | true_value.deps | false_value.deps,
             )
         if op == Opcode.GetElementPtr:
             ptr = self._eval_pointer(value, state)
@@ -514,20 +761,62 @@ class LLVMConcolicExecutor:
         if name.startswith("__striga_undef_"):
             return SymVal.unknown(f"{name}()", width)
         if name == "__striga_jmp":
-            target = self._eval_value(inst.get_arg_operand(0), state).with_width(64)
+            target_arg = inst.get_arg_operand(0)
+            target = self._eval_value(target_arg, state).with_width(64)
             state.boundary_call = name
-            state.boundary_value = target
+            state.boundary_value = self._annotate_control_load(target_arg, target, state)
             return SymVal.const(0, width)
         if name in {"__striga_call", "__striga_ret", "__striga_syscall"}:
-            target = self._eval_value(inst.get_arg_operand(0), state).with_width(64)
+            target_arg = inst.get_arg_operand(0)
+            target = self._eval_value(target_arg, state).with_width(64)
             state.boundary_call = name
-            state.boundary_value = target
+            state.boundary_value = self._annotate_control_load(target_arg, target, state)
             return SymVal.const(0, width)
         if name.startswith("llvm.fshl."):
             return self._eval_funnel_shift(inst, state, left=True)
         if name.startswith("llvm.fshr."):
             return self._eval_funnel_shift(inst, state, left=False)
         return SymVal.unknown(f"{name}()", width)
+
+    def _annotate_control_load(
+        self, arg: Value, target: SymVal, state: ExecutionState
+    ) -> SymVal:
+        if not arg.is_instruction or arg.opcode != Opcode.Load:
+            return target
+        if target.concrete is None:
+            return target
+        ptr = self._eval_pointer(arg.get_operand(0), state)
+        if ptr.kind != "memory" or ptr.offset is None:
+            return target
+        offset = ptr.offset.with_width(64)
+        source_addr = offset.concrete
+        if source_addr is None:
+            return target
+        insn_addr = instruction_address_from_metadata(arg)
+        if insn_addr is None:
+            return target
+        seed = Seed(
+            "control_load",
+            insn_addr,
+            target.concrete,
+            f"load i{target.width} from memory {source_addr:#x}; addr_expr={offset.text}",
+            source_addr,
+        )
+        add_seed(state.seeds, seed)
+        marker = seed_marker(seed)
+        if marker in target.text:
+            return target
+        return SymVal(
+            f"control_load[{source_addr:#x}]({target.text})/*{marker}*/",
+            target.concrete,
+            target.width,
+            target.address,
+            target.unknowns,
+            target.deps | frozenset({marker}),
+            target.xor_symbols,
+            target.xor_address,
+            target.xor_const,
+        )
 
     def _eval_binary(self, value: Value, state: ExecutionState) -> SymVal:
         width = value_width(value)
@@ -546,6 +835,7 @@ class LLVMConcolicExecutor:
             concrete,
             1,
             unknowns=(*lhs.unknowns, *rhs.unknowns),
+            deps=lhs.deps | rhs.deps,
         )
 
     def _eval_funnel_shift(self, value: Value, state: ExecutionState, *, left: bool) -> SymVal:
@@ -569,6 +859,7 @@ class LLVMConcolicExecutor:
             concrete,
             width,
             unknowns=(*lhs.unknowns, *rhs.unknowns, *shift.unknowns),
+            deps=lhs.deps | rhs.deps | shift.deps,
         )
 
     def _write_outputs(self, result: ConcolicResult) -> None:
@@ -622,6 +913,7 @@ def combine_values(lhs: SymVal, rhs: SymVal, opcode: Opcode, width: int | None) 
         width,
         address,
         (*lhs.unknowns, *rhs.unknowns),
+        lhs.deps | rhs.deps,
         xor_address=xor_address,
     )
 
@@ -652,7 +944,10 @@ def combine_xor(lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal | None:
     if const:
         parts.append(format_int(const))
     if not parts:
-        text = format_int(concrete or 0)
+        if has_provenance_marker(lhs.text) or has_provenance_marker(rhs.text):
+            text = f"({lhs.text} ^ {rhs.text})"
+        else:
+            text = format_int(concrete or 0)
     else:
         text = " ^ ".join(parts)
     return SymVal(
@@ -661,10 +956,15 @@ def combine_xor(lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal | None:
         width,
         value_address,
         (*lhs.unknowns, *rhs.unknowns),
+        lhs.deps | rhs.deps,
         frozenset(symbols),
         address,
         const,
     )
+
+
+def has_provenance_marker(text: str) -> bool:
+    return "/*" in text or "@0x" in text or "{addr=" in text
 
 
 def xor_components(value: SymVal) -> tuple[frozenset[str], Address | None, int]:
@@ -765,7 +1065,7 @@ def block_address(block: BasicBlock) -> int | None:
 
 def render_result(result: ConcolicResult) -> str:
     concrete = None if result.boundary_value is None else result.boundary_value.concrete
-    expression = "none" if result.boundary_value is None else result.boundary_value.text
+    expression = "none" if result.boundary_value is None else expression_with_deps(result.boundary_value)
     unknowns: tuple[str, ...] = () if result.boundary_value is None else result.boundary_value.unknowns
     lines = [
         "# LLVM concolic VM-entry report",
@@ -782,9 +1082,78 @@ def render_result(result: ConcolicResult) -> str:
         lines.append("- unknowns:")
         for item in sorted(set(unknowns)):
             lines.append(f"  - `{item}`")
+
+    lines.extend(["", "## Seeds involved in control-boundary expression", ""])
+    involved = involved_control_seeds(result)
+    if involved:
+        for seed in involved:
+            lines.append(
+                f"- `{seed.kind}` at `{seed.insn_addr:#x}` value `{mask_value(seed.value, 64):#x}`: {seed.detail}"
+            )
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Seed candidates", ""])
+    if result.seeds:
+        for seed in result.seeds:
+            lines.append(
+                f"- `{seed.kind}` at `{seed.insn_addr:#x}` value `{mask_value(seed.value, 64):#x}`: {seed.detail}"
+            )
+    else:
+        lines.append("- none")
+
     lines.extend(["", "## Trace prefix", ""])
     lines.extend(f"- `{item}`" for item in result.trace)
     return "\n".join(lines) + "\n"
+
+
+def expression_with_deps(value: SymVal) -> str:
+    missing = sorted(dep for dep in value.deps if dep not in value.text)
+    if not missing:
+        return value.text
+    return f"{value.text} {{deps={', '.join(missing)}}}"
+
+
+def involved_control_seeds(result: ConcolicResult) -> list[Seed]:
+    texts = [] if result.boundary_value is None else [result.boundary_value.text]
+    deps = frozenset() if result.boundary_value is None else result.boundary_value.deps
+    involved: list[Seed] = []
+    seen: set[tuple[str, int, int, str, int | None]] = set()
+    changed = True
+    while changed:
+        changed = False
+        for seed in result.seeds:
+            if seed.kind not in CONTROL_SEED_KINDS:
+                continue
+            key = (seed.kind, seed.insn_addr, mask_value(seed.value, 64), seed.detail, seed.source_addr)
+            if key in seen:
+                continue
+            marker = seed_marker(seed)
+            if marker not in deps and not any(marker in text for text in texts):
+                continue
+            seen.add(key)
+            involved.append(seed)
+            texts.append(seed.detail)
+            deps = deps | frozenset(extract_seed_markers(seed.detail))
+            changed = True
+    return involved
+
+
+def extract_seed_markers(text: str) -> set[str]:
+    markers: set[str] = set()
+    for kind in CONTROL_SEED_KINDS:
+        start = 0
+        needle = f"{kind}@"
+        while True:
+            index = text.find(needle, start)
+            if index < 0:
+                break
+            end = index + len(needle)
+            while end < len(text) and (text[end].isalnum() or text[end] in "xabcdefABCDEF:"):
+                end += 1
+            markers.add(text[index:end])
+            start = end
+    return markers
 
 
 def run(cfg: ConcolicConfig) -> ConcolicResult:

@@ -9,3 +9,4 @@ __pycache__/
 *.bc
 *.o
 .DS_Store
+devirt-output/
