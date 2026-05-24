@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import cast
 
+import smt_wire as smt
 from llvm import Opcode, create_context
 
 from striga import BoundaryResult, Interpreter, Semantics, StopResult
@@ -17,6 +18,9 @@ from striga.domains import (
     Interval,
     IntervalDomain,
     IntervalMemory,
+    SmtDomain,
+    SmtMemory,
+    SmtRegisters,
     TaintDomain,
     TaintMemory,
     TaintRegisters,
@@ -106,6 +110,37 @@ def test_counting_domain_profiles_lifted_add() -> None:
             assert regs.read("rax").ops.get("Add", 0) >= 1
 
 
+def test_smt_domain_builds_register_expression() -> None:
+    ctx = smt.Context()
+    with create_context() as context:
+        with context.create_module("smt_mov") as module:
+            sem = Semantics(module)
+            sem.begin(0x1000)
+            sem.lift_instruction(sem.cs_disasm(0x1000, b"\x48\x89\xc8"))  # mov rax, rcx
+
+            regs = SmtRegisters(
+                ctx,
+                sem.reg_sizes,
+                {"rcx": ctx.bv_var("in_rcx", 64)},
+                symbolic_missing=False,
+            )
+            interp = Interpreter(
+                SmtDomain(ctx),
+                regs,
+                SmtMemory(ctx),
+                sem.reg_sizes,
+                sem.state_ty,
+                sem.reg_indices,
+            )
+
+            interp.execute_block(sem.insn_blocks[0x1000])
+
+            rax = regs.read("rax")
+            assert isinstance(rax, smt.BVTerm)
+            assert "in_rcx" in rax.to_smt2()
+            assert SmtDomain(ctx).concrete_bool(ctx.bool_const(True)) is True
+
+
 def test_domain_memory_round_trips_sparse_writes() -> None:
     concrete = ConcreteMemory(bytearray(4), base=0x1000)
     concrete.write(ConcreteDomain().constant(0x800000, 64), ConcreteDomain().constant(0xAABBCCDD, 32), 32)
@@ -126,6 +161,12 @@ def test_domain_memory_round_trips_sparse_writes() -> None:
     counted_mem = CountingMemory()
     counted_mem.write(Counted.const(0x3000, 64), Counted.const(0x55, 8), 8)
     assert counted_mem.read(Counted.const(0x3000, 64), 8).value == 0x55
+
+    ctx = smt.Context()
+    smt_mem = SmtMemory(ctx)
+    smt_mem.write(ctx.bv_const(0x4000, 64), ctx.bv_const(0xBEEF, 16), 16)
+    smt_value = smt_mem.read(ctx.bv_const(0x4000, 64), 16)
+    assert smt_value.width == 16
 
 
 def test_concrete_boundary_result_uses_domain_value() -> None:
@@ -157,6 +198,7 @@ def main() -> None:
     test_taint_domain_propagates_register_labels()
     test_interval_domain_tracks_exact_addition()
     test_counting_domain_profiles_lifted_add()
+    test_smt_domain_builds_register_expression()
     test_domain_memory_round_trips_sparse_writes()
     test_concrete_boundary_result_uses_domain_value()
     test_stop_result_import_is_public()
