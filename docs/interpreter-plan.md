@@ -2,9 +2,9 @@
 
 ## 1. Motivation
 
-The `vmentry_provenance.py` tool contains a ~400-line LLVM IR interpreter tightly coupled to a single value domain (`SymVal` with provenance tracking). The interpreter's opcode dispatch, register routing, pointer resolution, and block/terminator handling are generic — they depend on Striga's lifting conventions, not on the provenance domain. Extracting this interpreter into Striga as a reusable primitive enables multiple analysis backends (concrete emulation, taint tracking, symbolic execution, interval analysis, instruction counting) without reimplementing the same LLVM IR walking logic.
+The `vmentry_concolic.py` tool contains a ~400-line LLVM IR interpreter tightly coupled to a single value domain (`SymVal` with provenance tracking). The interpreter's opcode dispatch, register routing, pointer resolution, and block/terminator handling are generic — they depend on Striga's lifting conventions, not on the provenance domain. Extracting this interpreter into Striga as a reusable primitive enables multiple analysis backends (concrete emulation, taint tracking, symbolic execution, interval analysis, instruction counting) without reimplementing the same LLVM IR walking logic.
 
-This document specifies the API shape, the required changes to `Semantics`, the interpreter core, the domain protocols, and concrete examples for each planned use case. It is intended as a complete implementation specification.
+This document specifies the API shape, the required changes to `Semantics`, the interpreter core, the domain protocols, and concrete examples for each planned use case. Phases 1–3 are intended as the complete implementation specification for the first merge. Phase 4 domain examples are design sketches for follow-up work.
 
 ---
 
@@ -95,9 +95,10 @@ src/striga/interpreter.py
 
 ```python
 from __future__ import annotations
-from typing import Protocol, TypeVar, Generic, Any, runtime_checkable
+import enum
+from typing import Protocol, TypeVar, Generic, runtime_checkable
 from dataclasses import dataclass
-from llvm import Opcode, IntPredicate, Value, BasicBlock, Function
+from llvm import Opcode, IntPredicate, Value, BasicBlock, Function, Type
 
 T = TypeVar("T")
 
@@ -142,22 +143,28 @@ class ValueDomain(Protocol[T]):
         """Resize a domain value (trunc/zext/sext to target width)."""
         ...
 
-    # --- Abstract interpretation support (future work) ---
-    # These methods are required for multi-path fixed-point analysis but not
-    # for single-trace execution. Current domains should raise NotImplementedError.
-    # See section 11 for design context and planned use cases.
+
+@runtime_checkable
+class AbstractValueDomain(ValueDomain[T], Protocol[T]):
+    """Extended domain protocol for multi-path fixed-point analysis (future work).
+
+    Separated from ValueDomain so that single-trace domains (Concrete, Provenance,
+    Counting) do not need to stub out methods they will never use. The worklist
+    driver (section 11) requires this protocol; the single-trace Interpreter does not.
+    See section 11 for design context and planned use cases.
+    """
 
     def join(self, a: T, b: T) -> T:
         """Least upper bound of two abstract values at a control-flow merge."""
-        raise NotImplementedError
+        ...
 
     def bottom(self, width: int | None) -> T:
         """Least element representing unreachable / no information yet."""
-        raise NotImplementedError
+        ...
 
     def is_leq(self, a: T, b: T) -> bool:
         """Partial order: is `a` already approximated by `b`? Used for fixed-point detection."""
-        raise NotImplementedError
+        ...
 
 
 @runtime_checkable
@@ -183,27 +190,34 @@ class MemoryState(Protocol[T]):
 @dataclass(frozen=True)
 class BoundaryResult(Generic[T]):
     """Execution reached a __striga_* boundary intrinsic."""
-    name: str          # e.g. "__striga_jmp", "__striga_call", "__striga_ret"
-    target: T
+    name: str              # e.g. "__striga_jmp", "__striga_call", "__striga_ret"
+    target: T              # evaluated boundary argument
+    target_arg: Value      # the LLVM Value passed to the intrinsic (before domain eval)
+    target_ptr: PtrVal[T] | None  # if target_arg was a Load, the pointer it loaded from
 
 @dataclass(frozen=True)
 class SymbolicBranch(Generic[T]):
     """Execution reached a conditional branch with a non-concrete condition."""
     condition: T
+    true_target: int
+    false_target: int
 
 @dataclass(frozen=True)
-class StepLimit:
-    """Execution exceeded the configured step limit."""
-    steps: int
+class StopResult(Generic[T]):
+    """Execution stopped at a ret or unsupported terminator."""
+    reason: str            # e.g. "ret", "unsupported_terminator_switch"
+    value: T | None = None # ret target if available, diagnostic value for unsupported ops
 ```
 
-Both `BoundaryResult` and `SymbolicBranch` are generic over `T`, which is bound by the `Interpreter[T]` that produces them. This means the type checker can see through result types to the concrete domain value — no `Any` escapes.
+All result types are generic over `T`, which is bound by the `Interpreter[T]` that produces them. This means the type checker can see through result types to the concrete domain value — no `Any` escapes.
 
-`execute_block` returns `int | BoundaryResult[T] | SymbolicBranch[T] | None`:
+`BoundaryResult` carries both the evaluated domain value (`target`) and the raw LLVM `Value` that produced it (`target_arg`), plus the resolved pointer if the argument was a memory load. This is required for `control_load` provenance: the provenance driver needs to see that `__striga_jmp` consumed a `Load` from a specific memory address in order to emit `control_load@INSN:ADDR`. Without `target_arg` and `target_ptr`, Themida and threaded-VM reports would regress because the driver could not reconstruct the load chain.
+
+`execute_block` returns `int | BoundaryResult[T] | SymbolicBranch[T] | StopResult[T]`:
 - `int` — next block address (follow the successor)
 - `BoundaryResult[T]` — hit a boundary intrinsic, stop
-- `SymbolicBranch[T]` — branch condition not concrete, stop
-- `None` — block ended with ret or unsupported terminator
+- `SymbolicBranch[T]` — branch condition not concrete; single-trace drivers stop, future fixed-point drivers can fork to `true_target` and `false_target`
+- `StopResult[T]` — block ended with ret or unsupported terminator
 
 ### 3.4. Pointer resolution
 
@@ -227,7 +241,7 @@ class PtrVal(Generic[T]):
 
 `PtrKind` uses `enum.Enum` (not `IntEnum`) so that `str(PtrKind.STATE)` prints `"state"` and the type checker prevents bare string comparisons. Matching uses `PtrKind.STATE`, `PtrKind.MEMORY`, `PtrKind.UNKNOWN`.
 
-A GEP from `%state` with a name present in `reg_sizes` is a state register pointer. A GEP from `%memory` is a memory pointer. Everything else is resolved by evaluating the pointer as an integer value.
+A GEP from `%state` whose source element type is `state_ty` is a state register pointer. Prefer resolving the register through the constant struct field index and `reg_indices`; accept the GEP name as a fallback because Striga names register GEPs after the target register. A GEP from `%memory` is a memory pointer. Everything else is resolved by evaluating the pointer as an integer value.
 
 ### 3.5. Interpreter class
 
@@ -239,15 +253,21 @@ class Interpreter(Generic[T]):
         regs: RegisterState[T],
         memory: MemoryState[T],
         reg_sizes: dict[str, int],
+        state_ty: Type,
+        reg_indices: dict[str, int],
+        hooks: InstructionHooks[T] | None = None,
     ) -> None:
         self.domain = domain
         self.regs = regs
         self.memory = memory
         self.reg_sizes = reg_sizes
+        self.state_ty = state_ty
+        self.reg_indices = reg_indices
+        self.hooks = hooks
         self._locals: dict[int, T | PtrVal[T]] = {}
 
-    def execute_block(self, block: BasicBlock) -> int | BoundaryResult[T] | SymbolicBranch[T] | None:
-        """Execute all instructions in a basic block. Returns next address or boundary."""
+    def execute_block(self, block: BasicBlock) -> int | BoundaryResult[T] | SymbolicBranch[T] | StopResult[T]:
+        """Execute all instructions in a basic block. Returns next address, boundary, or stop."""
         self._locals = {}
         for inst in block.instructions:
             if inst == block.terminator:
@@ -262,7 +282,14 @@ class Interpreter(Generic[T]):
         ...
 
     def eval_pointer(self, value: Value) -> PtrVal[T]:
-        """Evaluate an LLVM Value as a pointer, classifying state vs memory."""
+        """Evaluate an LLVM Value as a pointer, classifying state vs memory.
+
+        Uses state_ty and reg_indices to match GEP instructions against
+        the State struct layout. A GEP from %state whose field name is
+        present in reg_sizes is classified as PtrKind.STATE. A GEP from
+        %memory is classified as PtrKind.MEMORY. Everything else is
+        evaluated as an integer and wrapped as PtrKind.MEMORY.
+        """
         ...
 
     # --- Private methods ---
@@ -271,8 +298,8 @@ class Interpreter(Generic[T]):
         """Execute a non-terminator instruction. Returns BoundaryResult if boundary hit."""
         ...
 
-    def _execute_terminator(self, term: Value) -> int | SymbolicBranch[T] | None:
-        """Execute a block terminator. Returns next address, SymbolicBranch, or None."""
+    def _execute_terminator(self, term: Value) -> int | SymbolicBranch[T] | StopResult[T]:
+        """Execute a block terminator. Returns next address, SymbolicBranch, or StopResult."""
         ...
 
     def _eval_call(self, inst: Value) -> T | BoundaryResult[T]:
@@ -282,7 +309,7 @@ class Interpreter(Generic[T]):
 
 ### 3.6. Opcode dispatch in `eval_value`
 
-The interpreter handles the following LLVM opcodes. This list matches the current `vmentry_provenance.py` coverage:
+The interpreter handles the following LLVM opcodes. This list matches the current `vmentry_concolic.py` coverage:
 
 | Category | Opcodes |
 |---|---|
@@ -301,14 +328,14 @@ The interpreter handles the following LLVM opcodes. This list matches the curren
 
 The interpreter recognizes calls by function name:
 
-- `__striga_jmp`, `__striga_call`, `__striga_ret`, `__striga_syscall` → `BoundaryResult`
+- `__striga_jmp`, `__striga_call`, `__striga_ret`, `__striga_syscall` → evaluate the target, resolve `target_ptr` if the target argument is a `Load`, run `hooks.post_boundary(...)`, then return `BoundaryResult`
 - `__striga_undef_*` → `domain.unknown(...)`
 - `llvm.fshl.*`, `llvm.fshr.*` → `domain.funnel_shift(...)`
 - Unknown calls → `domain.unknown(...)`
 
 ### 3.8. Instruction address extraction
 
-The interpreter reads the `striga.insn` metadata attached by `Semantics.mem_read` and `Semantics.mem_write` to pass instruction addresses to the memory domain. The helper `instruction_address_from_metadata` from `vmentry_provenance.py` moves into the interpreter module.
+The interpreter reads the `striga.insn` metadata attached by `Semantics.mem_read` and `Semantics.mem_write` to pass instruction addresses to the memory domain. The helper `instruction_address_from_metadata` from `vmentry_concolic.py` moves into the interpreter module.
 
 ### 3.9. Block address extraction
 
@@ -328,13 +355,39 @@ class InstructionHooks(Protocol[T]):
 
     def post_store(self, inst: Value, value: T, ptr: PtrVal[T]) -> T:
         """Called after evaluating a store value, before writing. Can annotate/transform the value.
-        
-        This is the hook point for seed annotation in the provenance domain.
+
+        This is the hook point for annotating values with instruction-level seed markers
+        (e.g. annotate_value_with_instruction_seed in the provenance domain). It fires on
+        every Store instruction, allowing the hook to tag values with push_imm, mov_imm,
+        overlay_store, etc. before they reach registers or memory.
+        """
+        ...
+
+    def post_boundary(
+        self,
+        inst: Value,
+        name: str,
+        target: T,
+        target_arg: Value,
+        target_ptr: PtrVal[T] | None,
+    ) -> T:
+        """Called after evaluating a boundary intrinsic target, before returning BoundaryResult.
+
+        This is the hook point for control_load provenance. When __striga_jmp or
+        __striga_call consumes a value loaded from memory (e.g. jmp qword ptr [rax]),
+        the provenance domain needs the Load argument and its resolved pointer source
+        address to emit a control_load@INSN:ADDR seed. The interpreter passes both
+        target_arg and target_ptr so the hook does not need to reconstruct pointer
+        resolution after the fact.
+
+        Without this hook, Themida and threaded-VM control_load annotations would be lost
+        because BoundaryResult alone does not carry enough information to reconstruct
+        the load chain after the fact.
         """
         ...
 ```
 
-The hooks argument is optional in the `Interpreter` constructor. When `None`, no hooks are called.
+The hooks argument is optional in the `Interpreter` constructor. When `None`, no hooks are called and `post_store` / `post_boundary` default to returning the value unchanged.
 
 ---
 
@@ -363,17 +416,17 @@ def drive(container, sem, interp, start_rip, max_steps):
             return result
         if isinstance(result, SymbolicBranch):
             return result
-        if result is None:
-            return None
+        if isinstance(result, StopResult):
+            return result
         rip = result
-    return StepLimit(max_steps)
+    return StopResult("step_limit")
 ```
 
 The driver is intentionally not a Striga class. Each tool writes its own 10–20 line loop with tool-specific hooks, logging, and termination policy.
 
 ---
 
-## 5. Refactoring `vmentry_provenance.py`
+## 5. Refactoring `vmentry_concolic.py`
 
 ### 5.1. What moves into `src/striga/interpreter.py`
 
@@ -388,14 +441,14 @@ The driver is intentionally not a Striga class. Each tool writes its own 10–20
 - `instruction_address_from_metadata` → module-level function in interpreter
 - `block_address` → module-level function in interpreter
 
-### 5.2. What stays in `tools/vmentry_provenance.py`
+### 5.2. What stays in `tools/vmentry_concolic.py`
 
 - `SymVal` — the provenance value type (implements the domain protocol)
 - `MemoryModel` — the overlay memory model (implements the memory protocol)
 - `Seed`, `SeedKind`, seed recording, seed annotation
 - `_record_seed_candidates` — the Capstone-level pre-lift hook
-- `_annotate_control_load` — post-store hook via `InstructionHooks.post_store`
-- `annotate_value_with_instruction_seed` — post-store hook
+- `annotate_value_with_instruction_seed` — `InstructionHooks.post_store` (annotates values with seed markers before register/memory writes)
+- `_annotate_control_load` — `InstructionHooks.post_boundary` (annotates boundary targets with control_load seeds when the target was loaded from memory)
 - `ProvenanceConfig`, `ProvenanceResult`, `render_result` — tool-specific config/output
 - The driver loop in `ProvenanceExecutor.run`
 
@@ -493,15 +546,51 @@ class ProvenanceRegisters:
 
 ```python
 class ProvenanceHooks:
-    def __init__(self, seeds: list[Seed]):
+    def __init__(self, seeds: list[Seed], domain: ProvenanceDomain):
         self.seeds = seeds
+        self.domain = domain
 
     def pre_instruction(self, inst):
         pass
 
     def post_store(self, inst, value, ptr):
+        """Annotate values with instruction-level seed markers before writes."""
         insn_addr = instruction_address_from_metadata(inst)
         return annotate_value_with_instruction_seed(value, insn_addr, self.seeds)
+
+    def post_boundary(self, inst, name, target, target_arg, target_ptr):
+        """Annotate boundary targets with control_load seeds when loaded from memory.
+
+        When __striga_jmp/__striga_call consumes a Load (e.g. jmp qword ptr [rax]),
+        use target_ptr to get the source memory address and emit a
+        control_load@INSN:ADDR seed.
+        """
+        if not target_arg.is_instruction or target_arg.opcode != Opcode.Load:
+            return target
+        if target.concrete is None:
+            return target
+        if target_ptr is None or target_ptr.kind != PtrKind.MEMORY or target_ptr.offset is None:
+            return target
+        offset = self.domain.with_width(target_ptr.offset, 64)
+        source_addr = offset.concrete
+        if source_addr is None:
+            return target
+        insn_addr = instruction_address_from_metadata(target_arg)
+        if insn_addr is None:
+            return target
+        seed = Seed("control_load", insn_addr, target.concrete,
+                    f"load i{target.width} from memory {source_addr:#x}; addr_expr={offset.text}",
+                    source_addr)
+        add_seed(self.seeds, seed)
+        marker = seed_marker(seed)
+        if marker in target.text:
+            return target
+        return SymVal(
+            f"control_load[{source_addr:#x}]({target.text})/*{marker}*/",
+            target.concrete, target.width, target.address, target.unknowns,
+            target.deps | frozenset({marker}),
+            target.xor_symbols, target.xor_address, target.xor_const,
+        )
 ```
 
 ### 5.6. Refactored driver loop
@@ -517,8 +606,9 @@ class ProvenanceExecutor:
 
                 domain = ProvenanceDomain()
                 regs = ProvenanceRegisters(state.regs, sem.reg_sizes)
-                hooks = ProvenanceHooks(state.seeds)
-                interp = Interpreter(domain, regs, state.memory, sem.reg_sizes, hooks=hooks)
+                hooks = ProvenanceHooks(state.seeds, domain)
+                interp = Interpreter(domain, regs, state.memory, sem.reg_sizes,
+                                     sem.state_ty, sem.reg_indices, hooks=hooks)
 
                 rip = self.cfg.rip
                 for step in range(self.cfg.max_steps):
@@ -541,8 +631,9 @@ class ProvenanceExecutor:
                     result = interp.execute_block(block)
 
                     if isinstance(result, BoundaryResult):
+                        # control_load annotation already applied by ProvenanceHooks.post_boundary
                         state.boundary_call = result.name
-                        state.boundary_value = self._annotate_control_load_from_result(result, state)
+                        state.boundary_value = result.target
                         stop = rip
                         break
                     if isinstance(result, SymbolicBranch):
@@ -550,7 +641,9 @@ class ProvenanceExecutor:
                         state.boundary_value = result.condition
                         stop = rip
                         break
-                    if result is None:
+                    if isinstance(result, StopResult):
+                        state.boundary_call = result.reason
+                        state.boundary_value = result.value
                         stop = rip
                         break
                     rip = result
@@ -561,76 +654,94 @@ class ProvenanceExecutor:
 
 ## 6. Use Case Domains
 
-Each use case below specifies its domain, memory, register state, and a usage example.
+Each use case below sketches its domain, memory, register state, and a usage example. These examples guide later domain implementations; they are not required for the initial interpreter extraction.
 
 ### 6.1. Concrete Emulator
 
 **Purpose.** Fast execution for testing semantics correctness, fuzzing, and handler enumeration.
 
+**Value type.** A bare `int` cannot carry source width, which makes `with_width(..., signed=True)` impossible without the caller knowing the original width. The concrete domain uses a thin wrapper:
+
+```python
+@dataclass(frozen=True)
+class ConcreteValue:
+    value: int
+    width: int | None
+```
+
 **Domain.**
 
 ```python
+def eval_funnel_shift_value(high: int, low: int, amount: int, width: int | None, *, left: bool) -> int:
+    if width is None:
+        return 0
+    amt = amount % width
+    mask = (1 << width) - 1
+    if amt == 0:
+        return high & mask
+    if left:
+        return ((high << amt) | (low >> (width - amt))) & mask
+    return ((high >> amt) | (low << (width - amt))) & mask
+
+
 class ConcreteDomain:
-    """ValueDomain[int] — plain integer execution."""
+    """ValueDomain[ConcreteValue] — masked integer execution with width tracking."""
 
-    def constant(self, value: int, width: int | None) -> int:
-        return mask_value(value, width)
+    def constant(self, value: int, width: int | None) -> ConcreteValue:
+        return ConcreteValue(mask_value(value, width), width)
 
-    def unknown(self, text: str, width: int | None) -> int:
-        return 0  # or raise, depending on policy
+    def unknown(self, text: str, width: int | None) -> ConcreteValue:
+        return ConcreteValue(0, width)  # or raise, depending on policy
 
-    def binary(self, op: Opcode, lhs: int, rhs: int, width: int | None) -> int:
-        return eval_binary(op, lhs, rhs, width)
+    def binary(self, op: Opcode, lhs: ConcreteValue, rhs: ConcreteValue, width: int | None) -> ConcreteValue:
+        return ConcreteValue(eval_binary(op, lhs.value, rhs.value, width), width)
 
-    def icmp(self, predicate: IntPredicate, lhs: int, rhs: int, width: int | None) -> int:
-        return int(eval_icmp(predicate, lhs, rhs, width))
+    def icmp(self, predicate: IntPredicate, lhs: ConcreteValue, rhs: ConcreteValue, width: int | None) -> ConcreteValue:
+        return ConcreteValue(int(eval_icmp(predicate, lhs.value, rhs.value, lhs.width)), 1)
 
-    def select(self, cond: int, true_val: int, false_val: int, width: int | None) -> int:
-        return true_val if cond else false_val
+    def select(self, cond: ConcreteValue, true_val: ConcreteValue, false_val: ConcreteValue, width: int | None) -> ConcreteValue:
+        return true_val if cond.value else false_val
 
-    def cast(self, op: Opcode, val: int, from_width: int | None, to_width: int | None) -> int:
+    def cast(self, op: Opcode, val: ConcreteValue, from_width: int | None, to_width: int | None) -> ConcreteValue:
         if op == Opcode.Trunc:
-            return mask_value(val, to_width)
+            return ConcreteValue(mask_value(val.value, to_width), to_width)
         if op == Opcode.SExt:
-            return sext_value(val, from_width, to_width)
-        return mask_value(val, to_width)  # ZExt
+            return ConcreteValue(sext_value(val.value, from_width, to_width), to_width)
+        return ConcreteValue(mask_value(val.value, to_width), to_width)  # ZExt
 
-    def funnel_shift(self, high: int, low: int, amount: int, width: int | None, *, left: bool) -> int:
-        if width is None:
-            return 0
-        amt = amount % width
-        mask = (1 << width) - 1
-        if amt == 0:
-            return high & mask
-        if left:
-            return ((high << amt) | (low >> (width - amt))) & mask
-        return ((high >> amt) | (low << (width - amt))) & mask
+    def funnel_shift(self, high: ConcreteValue, low: ConcreteValue, amount: ConcreteValue, width: int | None, *, left: bool) -> ConcreteValue:
+        return ConcreteValue(
+            eval_funnel_shift_value(high.value, low.value, amount.value, width, left=left),
+            width,
+        )
 
-    def concrete_bool(self, val: int) -> bool | None:
-        return bool(val)
+    def concrete_bool(self, val: ConcreteValue) -> bool | None:
+        return bool(val.value)
 
-    def with_width(self, val: int, width: int | None, *, signed: bool = False) -> int:
+    def with_width(self, val: ConcreteValue, width: int | None, *, signed: bool = False) -> ConcreteValue:
         if signed:
-            return sext_value(val, width, width)  # no-op for same width, real sext otherwise
-        return mask_value(val, width)
+            return ConcreteValue(sext_value(val.value, val.width, width), width)
+        return ConcreteValue(mask_value(val.value, width), width)
 ```
 
 **Memory.**
 
 ```python
 class ConcreteMemory:
-    """MemoryState[int] — flat bytearray."""
+    """MemoryState[ConcreteValue] — flat bytearray."""
 
     def __init__(self, data: bytearray):
         self.data = data
 
-    def read(self, offset: int, width: int, *, insn_addr: int = 0) -> int:
+    def read(self, offset: ConcreteValue, width: int, *, insn_addr: int = 0) -> ConcreteValue:
         byte_width = width // 8
-        return int.from_bytes(self.data[offset:offset + byte_width], "little")
+        addr = offset.value
+        value = int.from_bytes(self.data[addr:addr + byte_width], "little")
+        return ConcreteValue(value, width)
 
-    def write(self, offset: int, value: int, width: int, *, insn_addr: int = 0) -> None:
+    def write(self, offset: ConcreteValue, value: ConcreteValue, width: int, *, insn_addr: int = 0) -> None:
         byte_width = width // 8
-        self.data[offset:offset + byte_width] = value.to_bytes(byte_width, "little")
+        self.data[offset.value:offset.value + byte_width] = value.value.to_bytes(byte_width, "little")
 ```
 
 **Registers.**
@@ -639,13 +750,16 @@ class ConcreteMemory:
 class ConcreteRegisters:
     def __init__(self, reg_sizes: dict[str, int], initial: dict[str, int] | None = None):
         self._sizes = reg_sizes
-        self._regs = {name: (initial or {}).get(name, 0) for name in reg_sizes}
+        self._regs: dict[str, ConcreteValue] = {
+            name: ConcreteValue((initial or {}).get(name, 0), size)
+            for name, size in reg_sizes.items()
+        }
 
-    def read(self, name: str) -> int:
+    def read(self, name: str) -> ConcreteValue:
         return self._regs[name]
 
-    def write(self, name: str, value: int) -> None:
-        self._regs[name] = mask_value(value, self._sizes[name])
+    def write(self, name: str, value: ConcreteValue) -> None:
+        self._regs[name] = ConcreteValue(mask_value(value.value, self._sizes[name]), self._sizes[name])
 
     def width(self, name: str) -> int:
         return self._sizes[name]
@@ -667,13 +781,14 @@ def test_xor_self_is_zero():
 
             regs = ConcreteRegisters(sem.reg_sizes, {"rax": 0xDEADBEEF})
             mem = ConcreteMemory(bytearray(4096))
-            interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes)
+            interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes,
+                                 sem.state_ty, sem.reg_indices)
 
             block = sem.insn_blocks[0x1000]
             interp.execute_block(block)
 
-            assert regs.read("rax") == 0
-            assert regs.read("zf") == 1
+            assert regs.read("rax").value == 0
+            assert regs.read("zf").value == 1
 ```
 
 **Usage: handler enumeration by sweeping opcode bytes.**
@@ -696,7 +811,8 @@ def discover_handlers(container, entry_rip, opcode_range):
                 image[BYTECODE_OFFSET] = opcode_byte
                 mem = ConcreteMemory(image)
 
-                interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes)
+                interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes,
+                                     sem.state_ty, sem.reg_indices)
                 rip = entry_rip
 
                 for _ in range(10_000):
@@ -708,7 +824,7 @@ def discover_handlers(container, entry_rip, opcode_range):
                     if isinstance(result, BoundaryResult):
                         handlers[opcode_byte] = result.target
                         break
-                    if result is None:
+                    if isinstance(result, (StopResult, SymbolicBranch)):
                         break
                     rip = result
 
@@ -758,7 +874,7 @@ class TaintDomain:
         return Tainted(mask_value(val.value, to_width), to_width, val.labels)
 
     def funnel_shift(self, high, low, amount, width, *, left) -> Tainted:
-        concrete = ConcreteDomain().funnel_shift(high.value, low.value, amount.value, width, left=left)
+        concrete = eval_funnel_shift_value(high.value, low.value, amount.value, width, left=left)
         return Tainted(concrete, width, high.labels | low.labels | amount.labels)
 
     def concrete_bool(self, val: Tainted) -> bool | None:
@@ -813,7 +929,8 @@ def taint_analysis(container, entry_rip):
                 "rsp": Tainted(0x7FFF0000, 64, frozenset()),
             })
             mem = TaintMemory(bytearray(container.size))
-            interp = Interpreter(TaintDomain(), regs, mem, sem.reg_sizes)
+            interp = Interpreter(TaintDomain(), regs, mem, sem.reg_sizes,
+                                 sem.state_ty, sem.reg_indices)
 
             rip = entry_rip
             for _ in range(50_000):
@@ -823,7 +940,7 @@ def taint_analysis(container, entry_rip):
                 if isinstance(result, BoundaryResult):
                     print(f"Dispatch target tainted by: {result.target.labels}")
                     break
-                if result is None:
+                if isinstance(result, (StopResult, SymbolicBranch)):
                     break
                 rip = result
 ```
@@ -999,7 +1116,8 @@ def verify_equivalent(container, rip_a, rip_b, input_regs: list[str]):
 
                 regs = SmtRegisters(ctx, sem.reg_sizes, inputs)
                 mem = SmtMemory(ctx, container)
-                interp = Interpreter(SmtDomain(ctx), regs, mem, sem.reg_sizes)
+                interp = Interpreter(SmtDomain(ctx), regs, mem, sem.reg_sizes,
+                                     sem.state_ty, sem.reg_indices)
 
                 current = rip
                 for _ in range(1000):
@@ -1008,7 +1126,7 @@ def verify_equivalent(container, rip_a, rip_b, input_regs: list[str]):
                     result = interp.execute_block(sem.insn_blocks[current])
                     if isinstance(result, BoundaryResult):
                         return result.target, {name: regs.read(name) for name in input_regs}
-                    if result is None:
+                    if isinstance(result, (StopResult, SymbolicBranch)):
                         return None, {name: regs.read(name) for name in input_regs}
                     current = result
                 return None, {name: regs.read(name) for name in input_regs}
@@ -1049,7 +1167,8 @@ def validate_instruction_semantics(asm_bytes: bytes, input_regs: list[str]):
 
             regs = SmtRegisters(ctx, sem.reg_sizes, inputs)
             mem = SmtMemory(ctx, None)
-            interp = Interpreter(SmtDomain(ctx), regs, mem, sem.reg_sizes)
+            interp = Interpreter(SmtDomain(ctx), regs, mem, sem.reg_sizes,
+                                 sem.state_ty, sem.reg_indices)
             interp.execute_block(sem.insn_blocks[0x1000])
 
             # Now regs contain SMT expressions.
@@ -1211,7 +1330,7 @@ class IntervalDomain:
         w = width or 64
         if high.is_exact and low.is_exact and amount.is_exact:
             return Interval.exact(
-                ConcreteDomain().funnel_shift(high.lo, low.lo, amount.lo, w, left=left), w)
+                eval_funnel_shift_value(high.lo, low.lo, amount.lo, w, left=left), w)
         return Interval.full(w)
 
     def concrete_bool(self, val):
@@ -1242,7 +1361,8 @@ def bound_jump_table(container, dispatch_rip):
                 "rsp": Interval.exact(0x7FFF0000, 64),
             })
             mem = IntervalMemory(container)
-            interp = Interpreter(IntervalDomain(), regs, mem, sem.reg_sizes)
+            interp = Interpreter(IntervalDomain(), regs, mem, sem.reg_sizes,
+                                 sem.state_ty, sem.reg_indices)
 
             rip = dispatch_rip
             for _ in range(1000):
@@ -1256,7 +1376,7 @@ def bound_jump_table(container, dispatch_rip):
                     else:
                         print(f"dispatch target range: {target.lo:#x}..{target.hi:#x} ({target.span} entries)")
                     break
-                if result is None:
+                if isinstance(result, (StopResult, SymbolicBranch)):
                     break
                 rip = result
 ```
@@ -1318,7 +1438,7 @@ class CountingDomain:
         return Counted(concrete, to_width, {**val.ops, op.name: val.ops.get(op.name, 0) + 1})
 
     def funnel_shift(self, high, low, amount, width, *, left):
-        concrete = ConcreteDomain().funnel_shift(high.value, low.value, amount.value, width, left=left)
+        concrete = eval_funnel_shift_value(high.value, low.value, amount.value, width, left=left)
         return Counted(concrete, width, high.merge_ops(low, amount, op_name="funnel_shift"))
 
     def concrete_bool(self, val):
@@ -1341,7 +1461,8 @@ def profile_handler(container, handler_rip):
 
             regs = CountingRegisters(sem.reg_sizes)
             mem = CountingMemory(container)
-            interp = Interpreter(CountingDomain(), regs, mem, sem.reg_sizes)
+            interp = Interpreter(CountingDomain(), regs, mem, sem.reg_sizes,
+                                 sem.state_ty, sem.reg_indices)
 
             rip = handler_rip
             total_blocks = 0
@@ -1354,7 +1475,7 @@ def profile_handler(container, handler_rip):
                     target = result.target
                     print(f"Handler {handler_rip:#x}: {total_blocks} blocks, ops: {target.ops}")
                     break
-                if result is None:
+                if isinstance(result, (StopResult, SymbolicBranch)):
                     break
                 rip = result
 ```
@@ -1380,7 +1501,8 @@ def simulate_patch(container, rip, patch_offset, patch_bytes, input_regs):
                 sem.begin(rip)
                 regs = ConcreteRegisters(sem.reg_sizes, input_regs)
                 mem = ConcreteMemory(bytearray(cont.raw_bytes()))
-                interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes)
+                interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes,
+                                     sem.state_ty, sem.reg_indices)
                 current = rip
                 for _ in range(10_000):
                     insn = sem.cs_disasm(current, cont.get_data(current, 15))
@@ -1388,7 +1510,7 @@ def simulate_patch(container, rip, patch_offset, patch_bytes, input_regs):
                     result = interp.execute_block(sem.insn_blocks[current])
                     if isinstance(result, BoundaryResult):
                         return result, {n: regs.read(n) for n in input_regs}
-                    if result is None:
+                    if isinstance(result, (StopResult, SymbolicBranch)):
                         return None, {n: regs.read(n) for n in input_regs}
                     current = result
                 return None, {}
@@ -1411,13 +1533,13 @@ def simulate_patch(container, rip, patch_offset, patch_bytes, input_regs):
 
 1. Add `lift_instruction(insn: CsInsn) -> list[Successor]` to `Semantics`.
 2. Refactor `lift_bytes` to call `lift_instruction` internally.
-3. Verify all existing callers still work (BFS lifter, brightening, vmentry_provenance).
+3. Verify all existing callers still work (BFS lifter, brightening, vmentry_concolic).
 
 ### Phase 2: Interpreter core (src/striga/interpreter.py)
 
-4. Define `ValueDomain`, `RegisterState`, `MemoryState` protocols.
-5. Define `PtrKind`, `PtrVal`, `BoundaryResult`, `SymbolicBranch` types.
-6. Move `instruction_address_from_metadata` and `block_address` from `vmentry_provenance.py`.
+4. Define `ValueDomain`, `AbstractValueDomain`, `RegisterState`, `MemoryState` protocols.
+5. Define `PtrKind`, `PtrVal`, `BoundaryResult`, `SymbolicBranch`, `StopResult` types.
+6. Move `instruction_address_from_metadata` and `block_address` from `vmentry_concolic.py`.
 7. Implement `Interpreter` class with:
    - `execute_block`
    - `eval_value` (full opcode dispatch)
@@ -1427,14 +1549,14 @@ def simulate_patch(container, rip, patch_offset, patch_bytes, input_regs):
    - `_eval_call` (boundary detection, undef, funnel shifts)
 8. Add optional `InstructionHooks` support.
 
-### Phase 3: Refactor vmentry_provenance.py
+### Phase 3: Refactor vmentry_concolic.py
 
 9. Implement `ProvenanceDomain(ValueDomain[SymVal])`.
 10. Implement `ProvenanceRegisters(RegisterState[SymVal])`.
 11. Implement `ProvenanceHooks(InstructionHooks[SymVal])`.
 12. Rewrite `ProvenanceExecutor.run` to use `Interpreter`.
-13. Remove duplicated opcode dispatch code from vmentry_provenance.
-14. Verify all existing test outputs remain identical (BinaryShield, VMProtect, Themida, minivm, stackvm samples).
+13. Remove duplicated opcode dispatch code from vmentry_concolic.
+14. Run `uv run python tests/test_vmentry_concolic_smoke.py` and verify all smoke cases pass (BinaryShield, VMProtect, Themida, minivm, stackvm samples).
 
 ### Phase 4: Additional domains (secondary, not required for initial merge)
 
@@ -1448,9 +1570,17 @@ def simulate_patch(container, rip, patch_offset, patch_bytes, input_regs):
 
 ## 8. Testing Strategy
 
-The primary test is provenance equivalence: after refactoring `vmentry_provenance.py` to use the interpreter, run all existing sample commands (BinaryShield, VMProtect, Themida, minivm-switch, minivm-threaded, stackvm-switch, stackvm-switch-old, stackvm-threaded) and verify that the output `summary.md` files are byte-identical to the pre-refactor outputs.
+The primary acceptance test is the runtime smoke suite:
 
-Broader interpreter correctness testing (lifting individual instructions, cross-validating against Unicorn, domain protocol compliance) is out of scope for this change. The provenance regression suite is the acceptance gate.
+```bash
+uv run python tests/test_vmentry_concolic_smoke.py
+```
+
+This suite covers BinaryShield, VMProtect, Themida `example2-virt.bin`, `minivm-switch`, `minivm-threaded`, `stackvm-switch`, `stackvm-switch-old`, and `stackvm-threaded`. It asserts the expected boundary kind, stop RIP, and concrete target for each case.
+
+Byte-identical `summary.md` comparisons are useful as an optional review aid, but they should not be the primary gate. Refactoring may legitimately improve expression rendering or seed ordering while preserving semantics.
+
+Broader interpreter correctness testing (lifting individual instructions, cross-validating against Unicorn, domain protocol compliance) is out of scope for the first implementation. The smoke suite plus `uv run ruff check .` and `uvx ty check` is the acceptance gate.
 
 ---
 
@@ -1465,7 +1595,7 @@ src/striga/
         *.py              # Existing semantic handlers, unchanged
 
 tools/
-    vmentry_provenance.py # Refactored to use Interpreter + ProvenanceDomain
+    vmentry_concolic.py # Refactored to use Interpreter + ProvenanceDomain
     domains/              # Secondary, not required for initial merge
         concrete.py       # ConcreteDomain, ConcreteRegisters, ConcreteMemory
         taint.py          # TaintDomain, TaintRegisters, TaintMemory
@@ -1488,7 +1618,7 @@ tools/
 
 ## 11. Future Work: Full Abstract Interpretation
 
-This section describes the design changes needed to support multi-path fixed-point analysis over the interpreter. None of this is in scope for the current implementation. It is documented here so that the protocol additions (`join`, `bottom`, `is_leq`) have clear design context and so that a future implementer does not need to rediscover the constraints.
+This section describes the design changes needed to support multi-path fixed-point analysis over the interpreter. None of this is in scope for the current implementation. It is documented here so that the `AbstractValueDomain` protocol (`join`, `bottom`, `is_leq`) has clear design context and so that a future implementer does not need to rediscover the constraints.
 
 ### 11.1. What single-trace execution cannot answer
 
@@ -1543,9 +1673,9 @@ Two options:
 
 Option 1 is lower-risk and preserves compatibility with the single-trace driver.
 
-### 11.4. SymbolicBranch semantics change
+### 11.4. SymbolicBranch semantics
 
-In the single-trace driver, `SymbolicBranch` means "stop." In the fixed-point driver, it means "fork — propagate the current state to both successors." The `SymbolicBranch` result type would need to carry both successor addresses:
+In the single-trace driver, `SymbolicBranch` means "stop." In the fixed-point driver, it means "fork — propagate the current state to both successors." The core `SymbolicBranch` result type already carries both successor addresses:
 
 ```python
 @dataclass(frozen=True)
@@ -1555,7 +1685,7 @@ class SymbolicBranch(Generic[T]):
     false_target: int
 ```
 
-This is backward-compatible: the single-trace driver ignores the target fields and stops. The fixed-point driver uses them to propagate.
+The single-trace driver ignores the target fields and stops. The fixed-point driver uses them to propagate.
 
 ### 11.5. Widening for loops
 
@@ -1563,7 +1693,7 @@ Without widening, a loop that increments a value causes the interval domain to i
 
 For intervals, widening is: if the new lower bound decreased, jump to 0; if the new upper bound increased, jump to the type maximum. One iteration of widening reaches the fixed point for any monotone loop.
 
-Widening is deliberately not included in the current `ValueDomain` protocol. Its design is heavily domain-specific (intervals widen differently from taint sets, SMT terms need a different strategy entirely), and there is no sensible default. When the fixed-point driver is built, `widen` should be added to the protocol alongside a policy for identifying loop headers (back-edge targets in the lifted CFG).
+Widening is deliberately not included in the current `AbstractValueDomain` protocol. Its design is heavily domain-specific (intervals widen differently from taint sets, SMT terms need a different strategy entirely), and there is no sensible default. When the fixed-point driver is built, `widen` should be added to `AbstractValueDomain` alongside a policy for identifying loop headers (back-edge targets in the lifted CFG).
 
 ### 11.6. Memory join
 
