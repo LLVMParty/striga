@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
+import sys
+from pathlib import Path
 from typing import cast
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import smt_wire as smt
 from llvm import Opcode, create_context
@@ -190,7 +198,10 @@ def test_concrete_boundary_result_uses_domain_value() -> None:
 
 
 def test_stop_result_import_is_public() -> None:
+    from tools.domains.concrete import ConcreteDomain as ToolConcreteDomain
+
     assert StopResult("ret").reason == "ret"
+    assert ToolConcreteDomain is ConcreteDomain
 
 
 def main() -> None:
