@@ -511,20 +511,9 @@ Each run writes three files:
 
 The summary is the primary artifact for analysis. The module is useful when the expression seems wrong or a semantics implementation needs auditing.
 
-## Relationship to the brightened evaluator
+## Pipeline role
 
-`docs/brightened-evaluator.md` describes a lift-optimize-sink primitive. That primitive is effective when the relevant memory facts can be exposed by rewriting a bounded lifted prefix and then running LLVM optimization.
-
-The concolic engine handles cases where the prefix contains long concrete loops, runtime table relocation, or sequential memory effects that must be observed in order. It still uses LLVM IR as the semantic representation, but it executes the IR instead of relying on LLVM optimization to summarize the entire prefix.
-
-The two tools serve different stages:
-
-| Stage | Tool | Role |
-|---|---|---|
-| VM-entry bootstrap | `tools/vmentry_concolic.py` | Run setup code to first concrete control boundary and recover seed provenance. |
-| Handler stepping | `tools/bright_step.py` | Summarize one handler/prefix and expose exits, VIP updates, and state effects. |
-
-The intended production pipeline uses the concolic engine to create the initial `(vip, rip, memory-overlay)` state and then uses handler stepping to grow the VM control-flow graph.
+The concolic engine is the supported VM-entry bootstrapper. It handles prefixes with long concrete loops, runtime table relocation, and sequential memory effects that must be observed in order. It uses LLVM IR as the semantic representation and executes that IR to recover the initial `(vip, rip, memory-overlay)` state for graph recovery.
 
 ## Current limitations
 

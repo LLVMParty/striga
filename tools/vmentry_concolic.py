@@ -18,7 +18,22 @@ from llvm import BasicBlock, Function, IntPredicate, Opcode, Value, create_conte
 
 from container import PEContainer
 from striga import Semantics
-from tools.bright_step import call_name, parse_assignment, parse_int
+
+
+def parse_int(text: str) -> int:
+    return int(text, 0)
+
+
+def parse_assignment(text: str) -> tuple[str, int]:
+    name, value = text.split("=", 1)
+    return name.strip().lower(), parse_int(value)
+
+
+def call_name(value: Value) -> str | None:
+    if not value.is_instruction or value.opcode != Opcode.Call:
+        return None
+    called = value.called_value
+    return called.name if called is not None else None
 
 
 SeedKind = Literal[
