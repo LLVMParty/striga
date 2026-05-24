@@ -3,6 +3,15 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
+name = "auto-faulthandler"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/6e/bee47cbc8f28f15807ac68993110e108f8a21c2796047815738eff980cca/auto_faulthandler-1.0.0.tar.gz", hash = "sha256:8f4abc997dcfe9958207e62cbe3d25bbb82a9c0abd1d958eef96c5300fa4c80e", size = 2783, upload-time = "2025-12-17T13:30:34.019Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/72/49/04190adbcf3dbb19e4163a8c97f29c6690b6bfee31c53b723c29fbd50409/auto_faulthandler-1.0.0-py3-none-any.whl", hash = "sha256:8b31016a4ac8032cf08f822e53a9e2bd2ee8ffd087b7b7a6706a258905cb5550", size = 3209, upload-time = "2025-12-17T13:30:32.734Z" },
+]
+
+[[package]]
 name = "capstone"
 version = "5.0.7"
 source = { registry = "https://pypi.org/simple" }
@@ -93,6 +102,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "auto-faulthandler" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -107,6 +117,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "auto-faulthandler", specifier = ">=1.0.0" },
     { name = "ruff", specifier = ">=0.15.12" },
     { name = "ty", specifier = ">=0.0.34" },
 ]
