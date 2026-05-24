@@ -351,7 +351,7 @@ class Semantics:
     def mem_read(self, addr: Value, ty: Type) -> Value:
         memory = self.function.get_param(1)
         ptr = self.ir.gep(self.i8, memory, [addr])
-        load = self.ir.load(ty, ptr, f"mem_read_{self.insn.address:x}")
+        load = self.ir.load(ty, ptr)
         load.inst_alignment = 1
         load.metadata["striga.insn"] = self.context.md_node(
             [self.context.md_string(hex(self.insn.address))]

@@ -487,13 +487,6 @@ def call_name(value: Value) -> str | None:
 
 
 def instruction_address_from_metadata(inst: Value) -> int | None:
-    name = inst.name
-    if name.startswith("mem_read_"):
-        token = name.removeprefix("mem_read_").split(".", 1)[0]
-        try:
-            return int(token, 16)
-        except ValueError:
-            pass
     md = inst.metadata.get("striga.insn")
     if md is None or not md.is_node:
         return None
