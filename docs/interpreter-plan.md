@@ -2,7 +2,7 @@
 
 ## 1. Motivation
 
-The `vmentry_concolic.py` tool contains a ~400-line LLVM IR interpreter tightly coupled to a single value domain (`SymVal` with provenance tracking). The interpreter's opcode dispatch, register routing, pointer resolution, and block/terminator handling are generic — they depend on Striga's lifting conventions, not on the provenance domain. Extracting this interpreter into Striga as a reusable primitive enables multiple analysis backends (concrete emulation, taint tracking, symbolic execution, interval analysis, instruction counting) without reimplementing the same LLVM IR walking logic.
+The `vmentry_concolic.py` tool contains a ~400-line LLVM IR interpreter tightly coupled to a single value domain (`SymVal` with provenance tracking). The interpreter's opcode dispatch, register routing, pointer resolution, and block/terminator handling are generic — they depend on Striga's lifting conventions, not on the provenance domain. Extracting this interpreter into Striga as a reusable primitive enables multiple analysis backends (concrete emulation, taint tracking, symbolic execution, interval analysis, and hook-based profiling) without reimplementing the same LLVM IR walking logic.
 
 This document specifies the API shape, the required changes to `Semantics`, the interpreter core, the domain protocols, and concrete examples for each planned use case. Phases 1–3 are intended as the complete implementation specification for the first merge. Phase 4 domain examples are design sketches for follow-up work.
 
@@ -149,7 +149,7 @@ class AbstractValueDomain(ValueDomain[T], Protocol[T]):
     """Extended domain protocol for multi-path fixed-point analysis (future work).
 
     Separated from ValueDomain so that single-trace domains (Concrete, Provenance,
-    Counting) do not need to stub out methods they will never use. The worklist
+    ProfilingHooks) do not need to stub out methods they will never use. The worklist
     driver (section 11) requires this protocol; the single-trace Interpreter does not.
     See section 11 for design context and planned use cases.
     """
@@ -1381,73 +1381,30 @@ def bound_jump_table(container, dispatch_rip):
                 rip = result
 ```
 
-### 6.5. Instruction Counting / Profiling
+### 6.5. Profiling via hooks
 
-**Purpose.** Count operations by type to identify expensive handlers and measure optimization effectiveness.
-
-**Domain.**
+**Purpose.** Count executed LLVM operations, stores, and boundary events to identify expensive handlers and measure optimization effectiveness. This is intentionally hook-based rather than a value domain: profiling is about instructions that executed, not about the expression tree that contributed to one result value.
 
 ```python
-@dataclass(frozen=True)
-class Counted:
-    value: int
-    width: int | None
-    ops: dict[str, int]  # opcode name → count
+@dataclass
+class ProfilingHooks:
+    instructions: int = 0
+    opcodes: dict[str, int] = field(default_factory=dict)
+    stores: int = 0
+    boundaries: dict[str, int] = field(default_factory=dict)
 
-    @staticmethod
-    def const(value: int, width: int | None) -> Counted:
-        return Counted(mask_value(value, width), width, {})
+    def pre_instruction(self, inst):
+        self.instructions += 1
+        name = inst.opcode.name
+        self.opcodes[name] = self.opcodes.get(name, 0) + 1
 
-    def merge_ops(self, *others: Counted, op_name: str) -> dict[str, int]:
-        merged = dict(self.ops)
-        for other in others:
-            for k, v in other.ops.items():
-                merged[k] = merged.get(k, 0) + v
-        merged[op_name] = merged.get(op_name, 0) + 1
-        return merged
+    def post_store(self, inst, value, ptr):
+        self.stores += 1
+        return value
 
-
-class CountingDomain:
-    """ValueDomain[Counted] — concrete execution with operation counting."""
-
-    def constant(self, value, width):
-        return Counted.const(value, width)
-
-    def unknown(self, text, width):
-        return Counted(0, width, {})
-
-    def binary(self, op, lhs, rhs, width):
-        concrete = eval_binary(op, lhs.value, rhs.value, width)
-        return Counted(concrete, width, lhs.merge_ops(rhs, op_name=op.name))
-
-    def icmp(self, predicate, lhs, rhs, width):
-        concrete = int(eval_icmp(predicate, lhs.value, rhs.value, lhs.width))
-        return Counted(concrete, 1, lhs.merge_ops(rhs, op_name=f"icmp_{predicate.name}"))
-
-    def select(self, cond, tv, fv, width):
-        chosen = tv if cond.value else fv
-        return Counted(chosen.value, width, cond.merge_ops(tv, fv, op_name="select"))
-
-    def cast(self, op, val, from_width, to_width):
-        if op == Opcode.Trunc:
-            concrete = mask_value(val.value, to_width)
-        elif op == Opcode.SExt:
-            concrete = sext_value(val.value, from_width, to_width)
-        else:
-            concrete = mask_value(val.value, to_width)
-        return Counted(concrete, to_width, {**val.ops, op.name: val.ops.get(op.name, 0) + 1})
-
-    def funnel_shift(self, high, low, amount, width, *, left):
-        concrete = eval_funnel_shift_value(high.value, low.value, amount.value, width, left=left)
-        return Counted(concrete, width, high.merge_ops(low, amount, op_name="funnel_shift"))
-
-    def concrete_bool(self, val):
-        return bool(val.value)
-
-    def with_width(self, val, width, *, signed=False):
-        if signed:
-            return Counted(sext_value(val.value, val.width, width), width, val.ops)
-        return Counted(mask_value(val.value, width), width, val.ops)
+    def post_boundary(self, inst, name, target, target_arg, target_ptr):
+        self.boundaries[name] = self.boundaries.get(name, 0) + 1
+        return target
 ```
 
 **Usage: profile a handler.**
@@ -1459,21 +1416,23 @@ def profile_handler(container, handler_rip):
             sem = Semantics(module)
             sem.begin(handler_rip)
 
-            regs = CountingRegisters(sem.reg_sizes)
-            mem = CountingMemory(container)
-            interp = Interpreter(CountingDomain(), regs, mem, sem.reg_sizes,
-                                 sem.state_ty, sem.reg_indices)
+            regs = ConcreteRegisters(sem.reg_sizes)
+            mem = ConcreteMemory(bytearray(container.raw_bytes()))
+            hooks = ProfilingHooks()
+            interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes,
+                                 sem.state_ty, sem.reg_indices, hooks=hooks)
 
             rip = handler_rip
-            total_blocks = 0
             for _ in range(10_000):
                 insn = sem.cs_disasm(rip, container.get_data(rip, 15))
                 sem.lift_instruction(insn)
                 result = interp.execute_block(sem.insn_blocks[rip])
-                total_blocks += 1
+
                 if isinstance(result, BoundaryResult):
-                    target = result.target
-                    print(f"Handler {handler_rip:#x}: {total_blocks} blocks, ops: {target.ops}")
+                    print(f"Handler {handler_rip:#x}: {hooks.instructions} LLVM instructions")
+                    print(f"  opcodes: {hooks.opcodes}")
+                    print(f"  stores: {hooks.stores}")
+                    print(f"  boundaries: {hooks.boundaries}")
                     break
                 if isinstance(result, (StopResult, SymbolicBranch)):
                     break
@@ -1564,7 +1523,7 @@ def simulate_patch(container, rip, patch_offset, patch_bytes, input_regs):
 16. `TaintDomain` + `TaintMemory`.
 17. `SmtDomain` + `SmtMemory`.
 18. `IntervalDomain`.
-19. `CountingDomain`.
+19. Hook-based profiling helpers or examples, if useful.
 
 ---
 
@@ -1580,7 +1539,7 @@ This suite covers BinaryShield, VMProtect, Themida `example2-virt.bin`, `minivm-
 
 Byte-identical `summary.md` comparisons are useful as an optional review aid, but they should not be the primary gate. Refactoring may legitimately improve expression rendering or seed ordering while preserving semantics.
 
-Broader interpreter correctness testing (lifting individual instructions, cross-validating against Unicorn, domain protocol compliance) is out of scope for the first implementation. The smoke suite plus `uv run ruff check .` and `uvx ty check` is the acceptance gate.
+Domain smoke tests should execute lifted instruction sequences, not just call domain helper methods directly. At minimum, cover register writes, memory round-trips, boundary hooks, and one expression-building case for SMT. Cross-validating broad instruction semantics against Unicorn remains out of scope for the first implementation. The smoke suite plus `uv run python tests/test_interpreter_domains.py`, `uv run ruff check .`, and `uvx ty check` is the acceptance gate.
 
 ---
 
@@ -1601,7 +1560,6 @@ tools/
         taint.py          # TaintDomain, TaintRegisters, TaintMemory
         smt.py            # SmtDomain, SmtRegisters, SmtMemory
         interval.py       # IntervalDomain, IntervalRegisters
-        counting.py       # CountingDomain, CountingRegisters
 ```
 
 ---
@@ -1714,7 +1672,7 @@ Not all domains are useful in a multi-path setting:
 | Taint (`Tainted`) | Yes | Join is label set union; concrete value is lost but taint propagation remains sound |
 | Interval | Yes | Join is enclosing interval; this is the classical use case for abstract interpretation |
 | SMT | Theoretically | Join is disjunction (`ite`); expressions grow exponentially without simplification |
-| Counting | No | Cost metrics are path-specific; joining counts from different paths is not meaningful |
+| Profiling hooks | No | Cost metrics are path-specific; aggregate in the driver instead of joining values |
 
 The practical multi-path domains are intervals and taint. The SMT domain can work but needs aggressive expression simplification at join points to avoid blowup.
 

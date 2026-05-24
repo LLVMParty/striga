@@ -174,6 +174,3 @@ class TaintRegisters(RegisterState[Tainted]):
 
     def width(self, name: str) -> int:
         return self._sizes[name]
-
-
-__all__ = ["TaintDomain", "TaintMemory", "TaintRegisters", "Tainted"]

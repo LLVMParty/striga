@@ -203,10 +203,13 @@ class IntervalRegisters(RegisterState[Interval]):
         self._sizes = reg_sizes
         initial = initial or {}
         self._regs: dict[str, Interval] = {}
+        domain = IntervalDomain()
         for name, size in reg_sizes.items():
             value = initial.get(name, 0)
             self._regs[name] = (
-                value if isinstance(value, Interval) else Interval.exact(value, size)
+                domain.with_width(value, size)
+                if isinstance(value, Interval)
+                else Interval.exact(value, size)
             )
 
     def read(self, name: str) -> Interval:
@@ -217,6 +220,3 @@ class IntervalRegisters(RegisterState[Interval]):
 
     def width(self, name: str) -> int:
         return self._sizes[name]
-
-
-__all__ = ["Interval", "IntervalDomain", "IntervalMemory", "IntervalRegisters"]
