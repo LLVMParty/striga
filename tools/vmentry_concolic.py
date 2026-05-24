@@ -6,7 +6,7 @@ import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -14,10 +14,11 @@ if str(ROOT) not in sys.path:
 
 from capstone import CS_GRP_CALL, CS_GRP_JUMP, CS_OP_IMM, CS_OP_MEM, CsInsn
 from capstone.x86_const import X86_REG_RIP
-from llvm import BasicBlock, Function, IntPredicate, Opcode, Value, create_context
+from llvm import IntPredicate, Opcode, Value, create_context
 
 from container import PEContainer
-from striga import Semantics
+from striga import BoundaryResult, Interpreter, PtrKind, PtrVal, Semantics, StopResult, SymbolicBranch
+from striga.interpreter import instruction_address_from_metadata
 
 
 def parse_int(text: str) -> int:
@@ -27,13 +28,6 @@ def parse_int(text: str) -> int:
 def parse_assignment(text: str) -> tuple[str, int]:
     name, value = text.split("=", 1)
     return name.strip().lower(), parse_int(value)
-
-
-def call_name(value: Value) -> str | None:
-    if not value.is_instruction or value.opcode != Opcode.Call:
-        return None
-    called = value.called_value
-    return called.name if called is not None else None
 
 
 SeedKind = Literal[
@@ -138,20 +132,6 @@ class SymVal:
 
 
 @dataclass(frozen=True)
-class PtrVal:
-    kind: Literal["state", "memory", "unknown"]
-    offset: SymVal | None = None
-    reg: str | None = None
-
-    def text(self) -> str:
-        if self.kind == "state":
-            return f"state.{self.reg}"
-        if self.kind == "memory" and self.offset is not None:
-            return f"memory[{self.offset.text}]"
-        return "unknown_ptr"
-
-
-@dataclass(frozen=True)
 class MemoryKey:
     base: str
     offset: int
@@ -243,10 +223,9 @@ class MemoryModel:
 
         return SymVal.unknown(f"load_i{width}({key.text()})", width)
 
-    def write(self, offset: SymVal, value: SymVal, *, insn_addr: int = 0) -> None:
+    def write(self, offset: SymVal, value: SymVal, width: int, *, insn_addr: int = 0) -> None:
         key = self.key_from_offset(offset)
-        width = value.width
-        if key is None or width is None or width % 8:
+        if key is None or width % 8:
             return
         byte_width = width // 8
         self._remove_overlapping_exact(key, byte_width)
@@ -362,7 +341,6 @@ class ExecutionState:
     regs: dict[str, SymVal]
     memory: MemoryModel
     seeds: list[Seed]
-    locals: dict[int, SymVal | PtrVal] = field(default_factory=dict)
     boundary_call: str | None = None
     boundary_value: SymVal | None = None
     steps: int = 0
@@ -415,10 +393,6 @@ def sext_value(value: int, from_width: int | None, to_width: int | None) -> int:
     return mask_value(sign_extend(value, from_width), to_width)
 
 
-def value_width(value: Value) -> int | None:
-    return value.type.int_width if value.type.is_integer else None
-
-
 def cast_text(name: str, text: str, width: int | None) -> str:
     return f"{name}({text} -> i{width})"
 
@@ -442,23 +416,6 @@ def add_seed(seeds: list[Seed], seed: Seed) -> None:
     ):
         return
     seeds.append(seed)
-
-
-def instruction_address_from_metadata(inst: Value) -> int | None:
-    name = inst.name
-    if name.startswith("mem_read_"):
-        token = name.removeprefix("mem_read_").split(".", 1)[0]
-        try:
-            return int(token, 16)
-        except ValueError:
-            pass
-    md = inst.metadata.get("striga.insn")
-    if md is None or not md.is_node:
-        return None
-    operands = md.operands
-    if not operands or not operands[0].is_string:
-        return None
-    return int(operands[0].string, 0)
 
 
 def annotate_value_with_instruction_seed(
@@ -490,6 +447,165 @@ def annotate_value_with_instruction_seed(
     return value
 
 
+class ProvenanceDomain:
+    def constant(self, value: int, width: int | None) -> SymVal:
+        return SymVal.const(value, width)
+
+    def unknown(self, text: str, width: int | None) -> SymVal:
+        return SymVal.unknown(text, width)
+
+    def binary(self, op: Opcode, lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal:
+        return combine_values(lhs, rhs, op, width)
+
+    def icmp(self, predicate: IntPredicate, lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal:
+        concrete = None
+        if lhs.concrete is not None and rhs.concrete is not None:
+            concrete = int(eval_icmp(predicate, lhs.concrete, rhs.concrete, width))
+        return SymVal(
+            f"icmp.{predicate.name.lower()}({lhs.text}, {rhs.text})",
+            concrete,
+            1,
+            unknowns=(*lhs.unknowns, *rhs.unknowns),
+            deps=lhs.deps | rhs.deps,
+        )
+
+    def select(self, cond: SymVal, true_val: SymVal, false_val: SymVal, width: int | None) -> SymVal:
+        if cond.concrete is not None:
+            return true_val if cond.concrete else false_val
+        concrete = true_val.concrete if true_val.concrete == false_val.concrete else None
+        return SymVal(
+            f"select({cond.text}, {true_val.text}, {false_val.text})",
+            concrete,
+            width,
+            unknowns=(*cond.unknowns, *true_val.unknowns, *false_val.unknowns),
+            deps=cond.deps | true_val.deps | false_val.deps,
+        )
+
+    def cast(self, op: Opcode, val: SymVal, from_width: int | None, to_width: int | None) -> SymVal:
+        if op == Opcode.Trunc:
+            concrete = None if val.concrete is None else mask_value(val.concrete, to_width)
+            return SymVal(
+                cast_text("trunc", val.text, to_width),
+                concrete,
+                to_width,
+                unknowns=val.unknowns,
+                deps=val.deps,
+                xor_const=mask_value(val.xor_const, to_width),
+            )
+        return val.with_width(to_width, signed=op == Opcode.SExt)
+
+    def funnel_shift(
+        self,
+        high: SymVal,
+        low: SymVal,
+        amount: SymVal,
+        width: int | None,
+        *,
+        left: bool,
+    ) -> SymVal:
+        concrete = None
+        if width is not None and high.concrete is not None and low.concrete is not None and amount.concrete is not None:
+            shift = amount.concrete % width
+            mask = (1 << width) - 1
+            if shift == 0:
+                concrete = high.concrete & mask
+            elif left:
+                concrete = ((high.concrete << shift) | (low.concrete >> (width - shift))) & mask
+            else:
+                concrete = ((high.concrete >> shift) | (low.concrete << (width - shift))) & mask
+        name = "fshl" if left else "fshr"
+        return SymVal(
+            f"{name}({high.text}, {low.text}, {amount.text})",
+            concrete,
+            width,
+            unknowns=(*high.unknowns, *low.unknowns, *amount.unknowns),
+            deps=high.deps | low.deps | amount.deps,
+        )
+
+    def concrete_bool(self, val: SymVal) -> bool | None:
+        return None if val.concrete is None else bool(val.concrete)
+
+    def with_width(self, val: SymVal, width: int | None, *, signed: bool = False) -> SymVal:
+        return val.with_width(width, signed=signed)
+
+
+class ProvenanceRegisters:
+    def __init__(self, regs: dict[str, SymVal], reg_sizes: dict[str, int]):
+        self._regs = regs
+        self._sizes = reg_sizes
+
+    def read(self, name: str) -> SymVal:
+        return self._regs[name]
+
+    def write(self, name: str, value: SymVal) -> None:
+        self._regs[name] = value.with_width(self._sizes[name])
+
+    def width(self, name: str) -> int:
+        return self._sizes[name]
+
+
+class ProvenanceHooks:
+    def __init__(self, seeds: list[Seed], domain: ProvenanceDomain):
+        self.seeds = seeds
+        self.domain = domain
+
+    def pre_instruction(self, inst: Value) -> None:
+        pass
+
+    def post_store(self, inst: Value, value: SymVal, ptr: PtrVal[SymVal]) -> SymVal:
+        del ptr
+        return annotate_value_with_instruction_seed(
+            value,
+            instruction_address_from_metadata(inst),
+            self.seeds,
+        )
+
+    def post_boundary(
+        self,
+        inst: Value,
+        name: str,
+        target: SymVal,
+        target_arg: Value,
+        target_ptr: PtrVal[SymVal] | None,
+    ) -> SymVal:
+        del inst, name
+        if not target_arg.is_instruction or target_arg.opcode != Opcode.Load:
+            return target
+        if target.concrete is None:
+            return target
+        if target_ptr is None or target_ptr.kind != PtrKind.MEMORY or target_ptr.offset is None:
+            return target
+        offset = self.domain.with_width(target_ptr.offset, 64)
+        source_addr = offset.concrete
+        if source_addr is None:
+            return target
+        insn_addr = instruction_address_from_metadata(target_arg)
+        if insn_addr is None:
+            return target
+        seed = Seed(
+            "control_load",
+            insn_addr,
+            target.concrete,
+            f"load i{target.width} from memory {source_addr:#x}; addr_expr={offset.text}",
+            source_addr,
+        )
+        add_seed(self.seeds, seed)
+        marker = seed_marker(seed)
+        if marker in target.text:
+            return target
+        return SymVal(
+            f"control_load[{source_addr:#x}]({target.text})/*{marker}*/",
+            target.concrete,
+            target.width,
+            target.address,
+            target.unknowns,
+            target.deps | frozenset({marker}),
+            target.xor_symbols,
+            target.xor_address,
+            target.xor_const,
+        )
+
+
 class LLVMConcolicExecutor:
     def __init__(self, container: PEContainer, cfg: ConcolicConfig):
         self.container = container
@@ -502,6 +618,18 @@ class LLVMConcolicExecutor:
                 sem = Semantics(module, verbose=False)
                 sem.begin(self.cfg.rip)
                 state = self._initial_state(sem)
+                domain = ProvenanceDomain()
+                regs = ProvenanceRegisters(state.regs, sem.reg_sizes)
+                hooks = ProvenanceHooks(state.seeds, domain)
+                interp: Interpreter[SymVal] = Interpreter(
+                    domain,
+                    regs,
+                    state.memory,
+                    sem.reg_sizes,
+                    sem.state_ty,
+                    sem.reg_indices,
+                    hooks=hooks,
+                )
                 rip = self.cfg.rip
                 stop = rip
                 instruction = ""
@@ -520,17 +648,29 @@ class LLVMConcolicExecutor:
                     else:
                         block = sem.get_or_create_block(rip)
                         if block.first_instruction is not None and block.first_instruction.opcode == Opcode.Ret:
-                            sem.lift_bytes(rip, code)
+                            sem.lift_instruction(insn)
 
                     block = sem.insn_blocks[rip]
-                    next_rip = self._execute_block(sem.function, block, state)
-                    if state.boundary_call is not None:
+                    block_result = interp.execute_block(block)
+                    if isinstance(block_result, BoundaryResult):
+                        boundary = cast("BoundaryResult[SymVal]", block_result)
+                        state.boundary_call = boundary.name
+                        state.boundary_value = boundary.target
                         stop = rip
                         break
-                    if next_rip is None:
+                    if isinstance(block_result, SymbolicBranch):
+                        branch = cast("SymbolicBranch[SymVal]", block_result)
+                        state.boundary_call = "symbolic_branch"
+                        state.boundary_value = branch.condition
                         stop = rip
                         break
-                    rip = next_rip
+                    if isinstance(block_result, StopResult):
+                        stop_result = cast("StopResult[SymVal]", block_result)
+                        state.boundary_call = stop_result.reason
+                        state.boundary_value = stop_result.value
+                        stop = rip
+                        break
+                    rip = block_result
                 else:
                     stop = rip
                     state.boundary_call = "step_limit"
@@ -610,295 +750,11 @@ class LLVMConcolicExecutor:
             ir.br(sem.get_or_create_block(target))
         sem.module.verify_or_raise()
 
-    def _execute_block(
-        self, function: Function, block: BasicBlock, state: ExecutionState
-    ) -> int | None:
-        state.locals = {}
-        for inst in block.instructions:
-            if inst == block.terminator:
-                break
-            self._execute_instruction(function, inst, state)
-            if state.boundary_call is not None:
-                return None
-        terminator = block.terminator
-        if terminator is None:
-            return None
-        if terminator.opcode == Opcode.Br:
-            if terminator.is_conditional:
-                cond = self._eval_value(terminator.condition, state).with_width(1)
-                if cond.concrete is None:
-                    state.boundary_call = "symbolic_branch"
-                    state.boundary_value = cond
-                    return None
-                successor = terminator.get_successor(0 if cond.concrete else 1)
-            else:
-                successor = terminator.get_successor(0)
-            return block_address(successor)
-        if terminator.opcode == Opcode.Ret:
-            return None
-        state.boundary_call = f"unsupported_terminator_{terminator.opcode.value}"
-        state.boundary_value = SymVal.unknown(str(terminator).strip(), None)
-        return None
-
-    def _execute_instruction(
-        self, function: Function, inst: Value, state: ExecutionState
-    ) -> None:
-        op = inst.opcode
-        if op == Opcode.Store:
-            value = annotate_value_with_instruction_seed(
-                self._eval_value(inst.get_operand(0), state),
-                instruction_address_from_metadata(inst),
-                state.seeds,
-            )
-            ptr = self._eval_pointer(inst.get_operand(1), state)
-            if ptr.kind == "state" and ptr.reg is not None:
-                state.regs[ptr.reg] = value.with_width(state.regs[ptr.reg].width)
-            elif ptr.kind == "memory" and ptr.offset is not None:
-                state.memory.write(
-                    ptr.offset.with_width(64),
-                    value,
-                    insn_addr=instruction_address_from_metadata(inst) or 0,
-                )
-            return
-        if op == Opcode.Call:
-            self._eval_call(inst, state)
-            return
-        if inst.type.is_void:
-            return
-        if op in {Opcode.Load, Opcode.GetElementPtr, Opcode.PtrToInt, Opcode.IntToPtr}:
-            if op == Opcode.GetElementPtr:
-                state.locals[hash(inst)] = self._eval_pointer(inst, state)
-            else:
-                state.locals[hash(inst)] = self._eval_value(inst, state)
-            return
-        state.locals[hash(inst)] = self._eval_value(inst, state)
-
-    def _eval_value(self, value: Value, state: ExecutionState) -> SymVal:
-        cached = state.locals.get(hash(value))
-        if isinstance(cached, SymVal):
-            return cached
-        width = value_width(value)
-        if value.is_constant_int:
-            return SymVal.const(value.const_zext_value, width)
-        if value.is_argument:
-            if value.name == "memory":
-                return SymVal.unknown("%memory", width)
-            if value.name == "state":
-                return SymVal.unknown("%state", width)
-            return SymVal.unknown(f"%{value.name}", width)
-        if not value.is_instruction:
-            return SymVal.unknown(str(value).strip(), width)
-        op = value.opcode
-        if op == Opcode.Load:
-            ptr = self._eval_pointer(value.get_operand(0), state)
-            if ptr.kind == "state" and ptr.reg is not None:
-                return state.regs[ptr.reg].with_width(width)
-            if ptr.kind == "memory" and ptr.offset is not None and width is not None:
-                return state.memory.read(
-                    ptr.offset.with_width(64),
-                    width,
-                    insn_addr=instruction_address_from_metadata(value) or 0,
-                )
-            return SymVal.unknown(f"load({ptr.text()})", width)
-        if op == Opcode.Call:
-            return self._eval_call(value, state)
-        if op in BINARY_OPS:
-            return self._eval_binary(value, state)
-        if op in {Opcode.Trunc, Opcode.ZExt, Opcode.SExt}:
-            inner = self._eval_value(value.get_operand(0), state)
-            if op == Opcode.Trunc:
-                concrete = None if inner.concrete is None else mask_value(inner.concrete, width)
-                return SymVal(
-                    cast_text("trunc", inner.text, width),
-                    concrete,
-                    width,
-                    unknowns=inner.unknowns,
-                    deps=inner.deps,
-                    xor_const=mask_value(inner.xor_const, width),
-                )
-            return inner.with_width(width, signed=op == Opcode.SExt)
-        if op == Opcode.ICmp:
-            return self._eval_icmp(value, state)
-        if op == Opcode.Select:
-            cond = self._eval_value(value.get_operand(0), state).with_width(1)
-            true_value = self._eval_value(value.get_operand(1), state).with_width(width)
-            false_value = self._eval_value(value.get_operand(2), state).with_width(width)
-            if cond.concrete is not None:
-                return true_value if cond.concrete else false_value
-            concrete = true_value.concrete if true_value.concrete == false_value.concrete else None
-            return SymVal(
-                f"select({cond.text}, {true_value.text}, {false_value.text})",
-                concrete,
-                width,
-                unknowns=(*cond.unknowns, *true_value.unknowns, *false_value.unknowns),
-                deps=cond.deps | true_value.deps | false_value.deps,
-            )
-        if op == Opcode.GetElementPtr:
-            ptr = self._eval_pointer(value, state)
-            if ptr.kind == "memory" and ptr.offset is not None:
-                return ptr.offset
-            return SymVal.unknown(ptr.text(), width)
-        if op == Opcode.PtrToInt:
-            ptr = self._eval_pointer(value.get_operand(0), state)
-            if ptr.kind == "memory" and ptr.offset is not None:
-                return ptr.offset.with_width(width)
-            return SymVal.unknown(f"ptrtoint({ptr.text()})", width)
-        if op == Opcode.IntToPtr:
-            return self._eval_value(value.get_operand(0), state).with_width(width)
-        return SymVal.unknown(f"unsupported:{op.value}:{str(value).strip()}", width)
-
-    def _eval_pointer(self, value: Value, state: ExecutionState) -> PtrVal:
-        cached = state.locals.get(hash(value))
-        if isinstance(cached, PtrVal):
-            return cached
-        if value.is_argument:
-            if value.name == "memory":
-                return PtrVal("memory", SymVal.const(0, 64))
-            if value.name == "state":
-                return PtrVal("state", reg="root")
-        if value.is_instruction and value.opcode == Opcode.GetElementPtr:
-            if value.name in state.regs and value.num_operands >= 1:
-                base = value.get_operand(0)
-                if base.is_argument and base.name == "state":
-                    return PtrVal("state", reg=value.name)
-            base_ptr = self._eval_pointer(value.get_operand(0), state)
-            index = self._eval_value(value.get_operand(value.num_operands - 1), state).with_width(64)
-            if base_ptr.kind == "memory" and base_ptr.offset is not None:
-                return PtrVal("memory", combine_values(base_ptr.offset, index, Opcode.Add, 64))
-        as_value = self._eval_value(value, state).with_width(64)
-        return PtrVal("memory", as_value)
-
-    def _eval_call(self, inst: Value, state: ExecutionState) -> SymVal:
-        name = call_name(inst)
-        width = value_width(inst)
-        if name is None:
-            return SymVal.unknown("unknown_call()", width)
-        if name.startswith("__striga_undef_"):
-            return SymVal.unknown(f"{name}()", width)
-        if name == "__striga_jmp":
-            target_arg = inst.get_arg_operand(0)
-            target = self._eval_value(target_arg, state).with_width(64)
-            state.boundary_call = name
-            state.boundary_value = self._annotate_control_load(target_arg, target, state)
-            return SymVal.const(0, width)
-        if name in {"__striga_call", "__striga_ret", "__striga_syscall"}:
-            target_arg = inst.get_arg_operand(0)
-            target = self._eval_value(target_arg, state).with_width(64)
-            state.boundary_call = name
-            state.boundary_value = self._annotate_control_load(target_arg, target, state)
-            return SymVal.const(0, width)
-        if name.startswith("llvm.fshl."):
-            return self._eval_funnel_shift(inst, state, left=True)
-        if name.startswith("llvm.fshr."):
-            return self._eval_funnel_shift(inst, state, left=False)
-        return SymVal.unknown(f"{name}()", width)
-
-    def _annotate_control_load(
-        self, arg: Value, target: SymVal, state: ExecutionState
-    ) -> SymVal:
-        if not arg.is_instruction or arg.opcode != Opcode.Load:
-            return target
-        if target.concrete is None:
-            return target
-        ptr = self._eval_pointer(arg.get_operand(0), state)
-        if ptr.kind != "memory" or ptr.offset is None:
-            return target
-        offset = ptr.offset.with_width(64)
-        source_addr = offset.concrete
-        if source_addr is None:
-            return target
-        insn_addr = instruction_address_from_metadata(arg)
-        if insn_addr is None:
-            return target
-        seed = Seed(
-            "control_load",
-            insn_addr,
-            target.concrete,
-            f"load i{target.width} from memory {source_addr:#x}; addr_expr={offset.text}",
-            source_addr,
-        )
-        add_seed(state.seeds, seed)
-        marker = seed_marker(seed)
-        if marker in target.text:
-            return target
-        return SymVal(
-            f"control_load[{source_addr:#x}]({target.text})/*{marker}*/",
-            target.concrete,
-            target.width,
-            target.address,
-            target.unknowns,
-            target.deps | frozenset({marker}),
-            target.xor_symbols,
-            target.xor_address,
-            target.xor_const,
-        )
-
-    def _eval_binary(self, value: Value, state: ExecutionState) -> SymVal:
-        width = value_width(value)
-        lhs = self._eval_value(value.get_operand(0), state).with_width(width)
-        rhs = self._eval_value(value.get_operand(1), state).with_width(width)
-        return combine_values(lhs, rhs, value.opcode, width)
-
-    def _eval_icmp(self, value: Value, state: ExecutionState) -> SymVal:
-        lhs = self._eval_value(value.get_operand(0), state)
-        rhs = self._eval_value(value.get_operand(1), state).with_width(lhs.width)
-        concrete = None
-        if lhs.concrete is not None and rhs.concrete is not None:
-            concrete = int(eval_icmp(value.icmp_predicate, lhs.concrete, rhs.concrete, lhs.width))
-        return SymVal(
-            f"icmp.{value.icmp_predicate.name.lower()}({lhs.text}, {rhs.text})",
-            concrete,
-            1,
-            unknowns=(*lhs.unknowns, *rhs.unknowns),
-            deps=lhs.deps | rhs.deps,
-        )
-
-    def _eval_funnel_shift(self, value: Value, state: ExecutionState, *, left: bool) -> SymVal:
-        width = value_width(value)
-        lhs = self._eval_value(value.get_arg_operand(0), state).with_width(width)
-        rhs = self._eval_value(value.get_arg_operand(1), state).with_width(width)
-        shift = self._eval_value(value.get_arg_operand(2), state).with_width(width)
-        concrete = None
-        if width is not None and lhs.concrete is not None and rhs.concrete is not None and shift.concrete is not None:
-            amount = shift.concrete % width
-            mask = (1 << width) - 1
-            if amount == 0:
-                concrete = lhs.concrete & mask
-            elif left:
-                concrete = ((lhs.concrete << amount) | (rhs.concrete >> (width - amount))) & mask
-            else:
-                concrete = ((lhs.concrete >> amount) | (rhs.concrete << (width - amount))) & mask
-        name = "fshl" if left else "fshr"
-        return SymVal(
-            f"{name}({lhs.text}, {rhs.text}, {shift.text})",
-            concrete,
-            width,
-            unknowns=(*lhs.unknowns, *rhs.unknowns, *shift.unknowns),
-            deps=lhs.deps | rhs.deps | shift.deps,
-        )
-
     def _write_outputs(self, result: ConcolicResult) -> None:
         self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
         (self.cfg.out_dir / "trace.txt").write_text("\n".join(result.trace) + "\n", encoding="utf-8")
         (self.cfg.out_dir / "module.ll").write_text(result.module_text + "\n", encoding="utf-8")
         (self.cfg.out_dir / "summary.md").write_text(render_result(result), encoding="utf-8")
-
-
-BINARY_OPS = {
-    Opcode.Add,
-    Opcode.Sub,
-    Opcode.Mul,
-    Opcode.UDiv,
-    Opcode.SDiv,
-    Opcode.URem,
-    Opcode.SRem,
-    Opcode.And,
-    Opcode.Or,
-    Opcode.Xor,
-    Opcode.Shl,
-    Opcode.LShr,
-    Opcode.AShr,
-}
 
 
 def combine_address(lhs: SymVal, rhs: SymVal, opcode: Opcode) -> Address | None:
@@ -1069,13 +925,6 @@ def eval_icmp(predicate: IntPredicate, lhs: int, rhs: int, width: int | None) ->
     if name == "SGE":
         return lhs_s >= rhs_s
     return False
-
-
-def block_address(block: BasicBlock) -> int | None:
-    name = block.name
-    if name.startswith("insn_"):
-        return int(name.removeprefix("insn_"), 16)
-    return None
 
 
 def render_result(result: ConcolicResult) -> str:
