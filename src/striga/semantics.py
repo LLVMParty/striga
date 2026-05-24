@@ -243,16 +243,16 @@ class Semantics:
         assert block.function == self.function
         return block
 
-    def lift_bytes(self, address: int, code: bytes) -> list[Successor]:
-        # Ensure we have a function to lift into
+    def lift_instruction(self, insn: CsInsn) -> list[Successor]:
+        """Lift an already-disassembled instruction into the current function."""
+        address = insn.address
         if not hasattr(self, "function"):
             self.begin(address)
 
-        insn = self.cs_disasm(address, code)
         if self.verbose:
             print(";", hex(insn.address), insn.mnemonic, insn.op_str)
 
-        # Skip lifting if the block is already populated
+        # Skip lifting if the block is already populated.
         block = self.get_or_create_block(address)
         assert block.first_instruction
         if block.first_instruction.opcode == Opcode.Ret:
@@ -261,7 +261,7 @@ class Semantics:
             return []
 
         with block.create_builder() as ir:
-            # State used by semantic handlers
+            # State used by semantic handlers.
             self.ir = ir
             self.insn = insn
 
@@ -280,9 +280,15 @@ class Semantics:
                 ir.br(self.get_or_create_block(fallthrough))
                 successors = [Successor(address, self.const64(fallthrough))]
 
-            # Make sure the handler produced valid IR
+            # Make sure the handler produced valid IR.
             self.module.verify_or_raise()
             return successors
+
+    def lift_bytes(self, address: int, code: bytes) -> list[Successor]:
+        """Disassemble and lift a single instruction. Convenience wrapper."""
+        if not hasattr(self, "function"):
+            self.begin(address)
+        return self.lift_instruction(self.cs_disasm(address, code))
 
     def reg_name(self, reg_id: int) -> str:
         return self.insn.reg_name(reg_id)  # pyright: ignore[reportReturnType]
