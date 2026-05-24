@@ -499,6 +499,14 @@ These examples show the executor's intended boundary semantics:
 - if/else dispatch stays inside the executor while opcode decisions are concrete;
 - data-dependent VM branches stop as `symbolic_branch` unless the user supplies concrete register inputs.
 
+The smoke cases are codified in `tests/test_vmentry_concolic_smoke.py`:
+
+```bash
+uv run python tests/test_vmentry_concolic_smoke.py
+```
+
+The test writes per-case summaries under `devirt-output/vmentry-concolic-smoke/` and asserts the expected boundary kind, stop RIP, and concrete target. It includes BinaryShield, VMProtect, Themida `tests/example2-virt.bin`, and the synthetic VM variants.
+
 ## Output files
 
 Each run writes three files:
