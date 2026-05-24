@@ -8,6 +8,7 @@ dependencies = [
     "icicle-emu>=0.0.11",
     "llvm-nanobind==21.1.6.3",
     "pefile>=2024.8.26",
+    "smt-wire[z3]",
 ]
 
 [project.urls]
@@ -21,6 +22,9 @@ build-backend = "hatchling.build"
 exclude = [
     "/tests",
 ]
+
+[tool.uv.sources]
+smt-wire = { git = "https://github.com/LLVMParty/smt-server.git", subdirectory = "python" }
 
 [dependency-groups]
 dev = [
