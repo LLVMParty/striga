@@ -235,7 +235,9 @@ def rotate_through_carry(sem: Semantics, *, left: bool):
     rotate_nonzero = sem.ir.icmp(
         IntPredicate.NE, rotate_count, rotate_count.type.constant(0)
     )
-    safe_count = sem.ir.select(rotate_nonzero, rotate_count, rotate_count.type.constant(1))
+    safe_count = sem.ir.select(
+        rotate_nonzero, rotate_count, rotate_count.type.constant(1)
+    )
 
     carry = sem.ir.zext(sem.flag_read("cf"), ext_ty)
     extended = sem.ir.or_(
@@ -356,7 +358,9 @@ def bsf(sem: Semantics):
     result = dst.type.constant(0)
     for bit in reversed(range(width)):
         mask = src.type.constant(str(1 << bit), 10)
-        is_set = sem.ir.icmp(IntPredicate.NE, sem.ir.and_(src, mask), src.type.constant(0))
+        is_set = sem.ir.icmp(
+            IntPredicate.NE, sem.ir.and_(src, mask), src.type.constant(0)
+        )
         result = sem.ir.select(is_set, dst.type.constant(bit), result)
     sem.op_write(0, sem.ir.select(zero, dst, result))
     sem.flag_write("zf", zero)

@@ -111,7 +111,11 @@ class SymVal:
             return self
         concrete = None
         if self.concrete is not None:
-            concrete = sext_value(self.concrete, self.width, width) if signed else mask_value(self.concrete, width)
+            concrete = (
+                sext_value(self.concrete, self.width, width)
+                if signed
+                else mask_value(self.concrete, width)
+            )
         address = self.address if width == 64 and self.width == 64 else None
         xor_address = self.xor_address if width == self.width else None
         xor_symbols = self.xor_symbols if width == self.width else frozenset()
@@ -135,7 +139,9 @@ class SymVal:
 
     @staticmethod
     def unknown(text: str, width: int | None) -> SymVal:
-        return SymVal(text, None, width, unknowns=(text,), xor_symbols=frozenset({text}))
+        return SymVal(
+            text, None, width, unknowns=(text,), xor_symbols=frozenset({text})
+        )
 
     @staticmethod
     def env(base: Literal["stack", "teb", "peb"], width: int = 64) -> SymVal:
@@ -201,7 +207,11 @@ class MemoryModel(MemoryState[SymVal]):
                 concrete |= (part.concrete & 0xFF) << (i * 8)
                 texts.append(part.text)
                 deps = deps | part.deps
-            text = format_int(concrete) if not deps and len(set(texts)) == 1 else "concat_le(" + ", ".join(texts) + ")"
+            text = (
+                format_int(concrete)
+                if not deps and len(set(texts)) == 1
+                else "concat_le(" + ", ".join(texts) + ")"
+            )
             return SymVal(
                 text,
                 mask_value(concrete, width),
@@ -211,7 +221,9 @@ class MemoryModel(MemoryState[SymVal]):
             )
 
         if key.base == "abs":
-            if self.container.in_range(key.offset) and self.container.in_range(key.offset + byte_width - 1):
+            if self.container.in_range(key.offset) and self.container.in_range(
+                key.offset + byte_width - 1
+            ):
                 data = self.container.get_data(key.offset, byte_width)
                 value = int.from_bytes(data, "little")
                 seed = Seed(
@@ -235,7 +247,9 @@ class MemoryModel(MemoryState[SymVal]):
 
         return SymVal.unknown(f"load_i{width}({key.text()})", width)
 
-    def write(self, offset: SymVal, value: SymVal, width: int, *, insn_addr: int = 0) -> None:
+    def write(
+        self, offset: SymVal, value: SymVal, width: int, *, insn_addr: int = 0
+    ) -> None:
         key = self.key_from_offset(offset)
         if key is None or width % 8:
             return
@@ -342,9 +356,13 @@ class MemoryModel(MemoryState[SymVal]):
             if key.offset == 0x60:
                 return SymVal.env("peb")
             if key.offset == 0x30:
-                return SymVal.const(0, 64, "teb.self_or_stack_cookie" )
+                return SymVal.const(0, 64, "teb.self_or_stack_cookie")
         if key.base == "peb" and key.offset == 0x10 and width == 64:
-            return SymVal.const(self.container.image_base, 64, f"{self.container.image_base:#x}/*image_base*/")
+            return SymVal.const(
+                self.container.image_base,
+                64,
+                f"{self.container.image_base:#x}/*image_base*/",
+            )
         return None
 
 
@@ -421,9 +439,22 @@ def seed_marker(seed: Seed) -> str:
 
 
 def add_seed(seeds: list[Seed], seed: Seed) -> None:
-    key = (seed.kind, seed.insn_addr, mask_value(seed.value, 64), seed.detail, seed.source_addr)
+    key = (
+        seed.kind,
+        seed.insn_addr,
+        mask_value(seed.value, 64),
+        seed.detail,
+        seed.source_addr,
+    )
     if any(
-        (item.kind, item.insn_addr, mask_value(item.value, 64), item.detail, item.source_addr) == key
+        (
+            item.kind,
+            item.insn_addr,
+            mask_value(item.value, 64),
+            item.detail,
+            item.source_addr,
+        )
+        == key
         for item in seeds
     ):
         return
@@ -440,7 +471,9 @@ def annotate_value_with_instruction_seed(
             continue
         if seed.insn_addr != insn_addr:
             continue
-        if mask_value(seed.value, value.width) != mask_value(value.concrete, value.width):
+        if mask_value(seed.value, value.width) != mask_value(
+            value.concrete, value.width
+        ):
             continue
         marker = seed_marker(seed)
         if marker in value.text:
@@ -469,7 +502,9 @@ class ProvenanceDomain(ValueDomain[SymVal]):
     def binary(self, op: Opcode, lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal:
         return combine_values(lhs, rhs, op, width)
 
-    def icmp(self, predicate: IntPredicate, lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal:
+    def icmp(
+        self, predicate: IntPredicate, lhs: SymVal, rhs: SymVal, width: int | None
+    ) -> SymVal:
         concrete = None
         if lhs.concrete is not None and rhs.concrete is not None:
             concrete = int(eval_icmp(predicate, lhs.concrete, rhs.concrete, width))
@@ -481,10 +516,14 @@ class ProvenanceDomain(ValueDomain[SymVal]):
             deps=lhs.deps | rhs.deps,
         )
 
-    def select(self, cond: SymVal, true_val: SymVal, false_val: SymVal, width: int | None) -> SymVal:
+    def select(
+        self, cond: SymVal, true_val: SymVal, false_val: SymVal, width: int | None
+    ) -> SymVal:
         if cond.concrete is not None:
             return true_val if cond.concrete else false_val
-        concrete = true_val.concrete if true_val.concrete == false_val.concrete else None
+        concrete = (
+            true_val.concrete if true_val.concrete == false_val.concrete else None
+        )
         return SymVal(
             f"select({cond.text}, {true_val.text}, {false_val.text})",
             concrete,
@@ -493,9 +532,13 @@ class ProvenanceDomain(ValueDomain[SymVal]):
             deps=cond.deps | true_val.deps | false_val.deps,
         )
 
-    def cast(self, op: Opcode, val: SymVal, from_width: int | None, to_width: int | None) -> SymVal:
+    def cast(
+        self, op: Opcode, val: SymVal, from_width: int | None, to_width: int | None
+    ) -> SymVal:
         if op == Opcode.Trunc:
-            concrete = None if val.concrete is None else mask_value(val.concrete, to_width)
+            concrete = (
+                None if val.concrete is None else mask_value(val.concrete, to_width)
+            )
             return SymVal(
                 cast_text("trunc", val.text, to_width),
                 concrete,
@@ -516,15 +559,24 @@ class ProvenanceDomain(ValueDomain[SymVal]):
         left: bool,
     ) -> SymVal:
         concrete = None
-        if width is not None and high.concrete is not None and low.concrete is not None and amount.concrete is not None:
+        if (
+            width is not None
+            and high.concrete is not None
+            and low.concrete is not None
+            and amount.concrete is not None
+        ):
             shift = amount.concrete % width
             mask = (1 << width) - 1
             if shift == 0:
                 concrete = high.concrete & mask
             elif left:
-                concrete = ((high.concrete << shift) | (low.concrete >> (width - shift))) & mask
+                concrete = (
+                    (high.concrete << shift) | (low.concrete >> (width - shift))
+                ) & mask
             else:
-                concrete = ((high.concrete >> shift) | (low.concrete << (width - shift))) & mask
+                concrete = (
+                    (high.concrete >> shift) | (low.concrete << (width - shift))
+                ) & mask
         name = "fshl" if left else "fshr"
         return SymVal(
             f"{name}({high.text}, {low.text}, {amount.text})",
@@ -537,7 +589,9 @@ class ProvenanceDomain(ValueDomain[SymVal]):
     def concrete_bool(self, val: SymVal) -> bool | None:
         return None if val.concrete is None else bool(val.concrete)
 
-    def with_width(self, val: SymVal, width: int | None, *, signed: bool = False) -> SymVal:
+    def with_width(
+        self, val: SymVal, width: int | None, *, signed: bool = False
+    ) -> SymVal:
         return val.with_width(width, signed=signed)
 
 
@@ -585,7 +639,11 @@ class ProvenanceHooks(InstructionHooks[SymVal]):
             return target
         if target.concrete is None:
             return target
-        if target_ptr is None or target_ptr.kind != PtrKind.MEMORY or target_ptr.offset is None:
+        if (
+            target_ptr is None
+            or target_ptr.kind != PtrKind.MEMORY
+            or target_ptr.offset is None
+        ):
             return target
         offset = self.domain.with_width(target_ptr.offset, 64)
         source_addr = offset.concrete
@@ -659,7 +717,10 @@ class LLVMConcolicExecutor:
                         self._lift_followed_call(sem, insn)
                     else:
                         block = sem.get_or_create_block(rip)
-                        if block.first_instruction is not None and block.first_instruction.opcode == Opcode.Ret:
+                        if (
+                            block.first_instruction is not None
+                            and block.first_instruction.opcode == Opcode.Ret
+                        ):
                             sem.lift_instruction(insn)
 
                     block = sem.insn_blocks[rip]
@@ -742,14 +803,27 @@ class LLVMConcolicExecutor:
                     kind = "push_imm"
                 elif insn.mnemonic in {"mov", "movabs"}:
                     kind = "mov_imm"
-                add_seed(state.seeds, Seed(kind, insn.address, op.imm, f"{insn.mnemonic} {insn.op_str}"))
-            elif op.type == CS_OP_MEM and insn.mnemonic == "lea" and op.mem.base == X86_REG_RIP:
+                add_seed(
+                    state.seeds,
+                    Seed(kind, insn.address, op.imm, f"{insn.mnemonic} {insn.op_str}"),
+                )
+            elif (
+                op.type == CS_OP_MEM
+                and insn.mnemonic == "lea"
+                and op.mem.base == X86_REG_RIP
+            ):
                 addr = insn.address + insn.size + op.mem.disp
-                add_seed(state.seeds, Seed("lea_addr", insn.address, addr, f"lea {insn.op_str}"))
+                add_seed(
+                    state.seeds,
+                    Seed("lea_addr", insn.address, addr, f"lea {insn.op_str}"),
+                )
 
     def _lift_followed_call(self, sem: Semantics, insn: CsInsn) -> None:
         block = sem.get_or_create_block(insn.address)
-        if block.first_instruction is not None and block.first_instruction.opcode == Opcode.Ret:
+        if (
+            block.first_instruction is not None
+            and block.first_instruction.opcode == Opcode.Ret
+        ):
             block.first_instruction.erase_from_parent()
         else:
             return
@@ -764,9 +838,15 @@ class LLVMConcolicExecutor:
 
     def _write_outputs(self, result: ConcolicResult) -> None:
         self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
-        (self.cfg.out_dir / "trace.txt").write_text("\n".join(result.trace) + "\n", encoding="utf-8")
-        (self.cfg.out_dir / "module.ll").write_text(result.module_text + "\n", encoding="utf-8")
-        (self.cfg.out_dir / "summary.md").write_text(render_result(result), encoding="utf-8")
+        (self.cfg.out_dir / "trace.txt").write_text(
+            "\n".join(result.trace) + "\n", encoding="utf-8"
+        )
+        (self.cfg.out_dir / "module.ll").write_text(
+            result.module_text + "\n", encoding="utf-8"
+        )
+        (self.cfg.out_dir / "summary.md").write_text(
+            render_result(result), encoding="utf-8"
+        )
 
 
 def combine_address(lhs: SymVal, rhs: SymVal, opcode: Opcode) -> Address | None:
@@ -780,7 +860,9 @@ def combine_address(lhs: SymVal, rhs: SymVal, opcode: Opcode) -> Address | None:
     return None
 
 
-def combine_values(lhs: SymVal, rhs: SymVal, opcode: Opcode, width: int | None) -> SymVal:
+def combine_values(
+    lhs: SymVal, rhs: SymVal, opcode: Opcode, width: int | None
+) -> SymVal:
     if opcode == Opcode.Xor:
         simplified = combine_xor(lhs, rhs, width)
         if simplified is not None:
@@ -814,13 +896,13 @@ def combine_xor(lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal | None:
     elif lhs_address == rhs_address:
         address = None
     else:
-        symbols = symbols.symmetric_difference(
-            {lhs_address.text(), rhs_address.text()}
-        )
+        symbols = symbols.symmetric_difference({lhs_address.text(), rhs_address.text()})
         address = None
     const = mask_value(lhs_const ^ rhs_const, width)
     concrete = const if address is None and not symbols else None
-    value_address = address if address is not None and not symbols and const == 0 else None
+    value_address = (
+        address if address is not None and not symbols and const == 0 else None
+    )
     parts = sorted(symbols)
     if address is not None:
         parts.insert(0, address.text())
@@ -872,7 +954,9 @@ def eval_binary(opcode: Opcode, lhs: int, rhs: int, width: int | None) -> int:
     elif opcode == Opcode.UDiv:
         value = 0 if rhs == 0 else lhs // rhs
     elif opcode == Opcode.SDiv:
-        value = 0 if rhs == 0 else int(sign_extend(lhs, width) / sign_extend(rhs, width))
+        value = (
+            0 if rhs == 0 else int(sign_extend(lhs, width) / sign_extend(rhs, width))
+        )
     elif opcode == Opcode.URem:
         value = 0 if rhs == 0 else lhs % rhs
     elif opcode == Opcode.SRem:
@@ -941,8 +1025,14 @@ def eval_icmp(predicate: IntPredicate, lhs: int, rhs: int, width: int | None) ->
 
 def render_result(result: ConcolicResult) -> str:
     concrete = None if result.boundary_value is None else result.boundary_value.concrete
-    expression = "none" if result.boundary_value is None else expression_with_deps(result.boundary_value)
-    unknowns: tuple[str, ...] = () if result.boundary_value is None else result.boundary_value.unknowns
+    expression = (
+        "none"
+        if result.boundary_value is None
+        else expression_with_deps(result.boundary_value)
+    )
+    unknowns: tuple[str, ...] = (
+        () if result.boundary_value is None else result.boundary_value.unknowns
+    )
     lines = [
         "# LLVM concolic VM-entry report",
         "",
@@ -1001,7 +1091,13 @@ def involved_control_seeds(result: ConcolicResult) -> list[Seed]:
         for seed in result.seeds:
             if seed.kind not in CONTROL_SEED_KINDS:
                 continue
-            key = (seed.kind, seed.insn_addr, mask_value(seed.value, 64), seed.detail, seed.source_addr)
+            key = (
+                seed.kind,
+                seed.insn_addr,
+                mask_value(seed.value, 64),
+                seed.detail,
+                seed.source_addr,
+            )
             if key in seen:
                 continue
             marker = seed_marker(seed)
@@ -1025,7 +1121,9 @@ def extract_seed_markers(text: str) -> set[str]:
             if index < 0:
                 break
             end = index + len(needle)
-            while end < len(text) and (text[end].isalnum() or text[end] in "xabcdefABCDEF:"):
+            while end < len(text) and (
+                text[end].isalnum() or text[end] in "xabcdefABCDEF:"
+            ):
                 end += 1
             markers.add(text[index:end])
             start = end
@@ -1047,7 +1145,9 @@ def main() -> None:
     )
     parser.add_argument("--binary", default="tests/binaryshield.exe")
     parser.add_argument("--rip", required=True, type=parse_int)
-    parser.add_argument("--out-dir", type=Path, default=Path("devirt-output/vmentry-concolic"))
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("devirt-output/vmentry-concolic")
+    )
     parser.add_argument("--follow-call", action="append", default=[], type=parse_int)
     parser.add_argument("--reg", action="append", default=[])
     parser.add_argument("--max-steps", type=int, default=200_000)

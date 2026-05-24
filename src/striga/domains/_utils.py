@@ -7,18 +7,14 @@ from llvm import IntPredicate, Opcode
 
 class MemoryBacking(Protocol):
     @property
-    def image_base(self) -> int:
-        ...
+    def image_base(self) -> int: ...
 
     @property
-    def image_size(self) -> int:
-        ...
+    def image_size(self) -> int: ...
 
-    def in_range(self, va: int) -> bool:
-        ...
+    def in_range(self, va: int) -> bool: ...
 
-    def get_data(self, va: int, size: int) -> bytes:
-        ...
+    def get_data(self, va: int, size: int) -> bytes: ...
 
 
 def mask_value(value: int, width: int | None) -> int:
@@ -110,7 +106,9 @@ def eval_icmp(predicate: IntPredicate, lhs: int, rhs: int, width: int | None) ->
     return False
 
 
-def eval_funnel_shift_value(high: int, low: int, amount: int, width: int | None, *, left: bool) -> int:
+def eval_funnel_shift_value(
+    high: int, low: int, amount: int, width: int | None, *, left: bool
+) -> int:
     if width is None or width <= 0:
         return 0
     shift = amount % width
@@ -129,4 +127,6 @@ def bytes_for_width(width: int) -> int:
 
 
 def data_from_backing(backing: MemoryBacking) -> tuple[bytearray, int]:
-    return bytearray(backing.get_data(backing.image_base, backing.image_size)), backing.image_base
+    return bytearray(
+        backing.get_data(backing.image_base, backing.image_size)
+    ), backing.image_base

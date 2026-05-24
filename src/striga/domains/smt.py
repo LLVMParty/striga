@@ -26,7 +26,9 @@ class SmtDomain(ValueDomain[SmtTerm]):
     def unknown(self, text: str, width: int | None) -> smt.BVTerm:
         return self.ctx.bv_var(_symbol_name(text), width or 64)
 
-    def binary(self, op: Opcode, lhs: SmtTerm, rhs: SmtTerm, width: int | None) -> smt.BVTerm:
+    def binary(
+        self, op: Opcode, lhs: SmtTerm, rhs: SmtTerm, width: int | None
+    ) -> smt.BVTerm:
         lhs_bv = self._as_bv(lhs, width)
         rhs_bv = self._as_bv(rhs, width or lhs_bv.width)
         ops = {
@@ -46,7 +48,9 @@ class SmtDomain(ValueDomain[SmtTerm]):
         }
         return ops[op](lhs_bv, rhs_bv)
 
-    def icmp(self, predicate: IntPredicate, lhs: SmtTerm, rhs: SmtTerm, width: int | None) -> smt.BoolTerm:
+    def icmp(
+        self, predicate: IntPredicate, lhs: SmtTerm, rhs: SmtTerm, width: int | None
+    ) -> smt.BoolTerm:
         lhs_bv = self._as_bv(lhs, width)
         rhs_bv = self._as_bv(rhs, lhs_bv.width)
         preds = {
@@ -63,12 +67,16 @@ class SmtDomain(ValueDomain[SmtTerm]):
         }
         return preds[predicate.name](lhs_bv, rhs_bv)
 
-    def select(self, cond: SmtTerm, true_val: SmtTerm, false_val: SmtTerm, width: int | None) -> SmtTerm:
+    def select(
+        self, cond: SmtTerm, true_val: SmtTerm, false_val: SmtTerm, width: int | None
+    ) -> SmtTerm:
         true_term = self.with_width(true_val, width)
         false_term = self.with_width(false_val, width or self._term_width(true_term))
         return cast("SmtTerm", self.ctx.ite(self._as_bool(cond), true_term, false_term))
 
-    def cast(self, op: Opcode, val: SmtTerm, from_width: int | None, to_width: int | None) -> SmtTerm:
+    def cast(
+        self, op: Opcode, val: SmtTerm, from_width: int | None, to_width: int | None
+    ) -> SmtTerm:
         del from_width
         if to_width is None:
             return val
@@ -128,7 +136,9 @@ class SmtDomain(ValueDomain[SmtTerm]):
             return bool(val.value)
         return None
 
-    def with_width(self, val: SmtTerm, width: int | None, *, signed: bool = False) -> SmtTerm:
+    def with_width(
+        self, val: SmtTerm, width: int | None, *, signed: bool = False
+    ) -> SmtTerm:
         if isinstance(val, smt.BoolTerm):
             target_width = width or 1
             return cast(
@@ -182,7 +192,9 @@ class SmtMemory(MemoryState[SmtTerm]):
         bytes_le = [self._read_byte(address + i, insn_addr) for i in range(byte_width)]
         return _concat_le(self.ctx, bytes_le)
 
-    def write(self, offset: SmtTerm, value: SmtTerm, width: int, *, insn_addr: int = 0) -> None:
+    def write(
+        self, offset: SmtTerm, value: SmtTerm, width: int, *, insn_addr: int = 0
+    ) -> None:
         del insn_addr
         byte_width = bytes_for_width(width)
         address = self._concrete_offset(offset)

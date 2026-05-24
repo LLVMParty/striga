@@ -34,7 +34,9 @@ class ConcreteDomain(ValueDomain[ConcreteValue]):
         del text
         return ConcreteValue(0, width)
 
-    def binary(self, op: Opcode, lhs: ConcreteValue, rhs: ConcreteValue, width: int | None) -> ConcreteValue:
+    def binary(
+        self, op: Opcode, lhs: ConcreteValue, rhs: ConcreteValue, width: int | None
+    ) -> ConcreteValue:
         return ConcreteValue(eval_binary(op, lhs.value, rhs.value, width), width)
 
     def icmp(
@@ -76,14 +78,18 @@ class ConcreteDomain(ValueDomain[ConcreteValue]):
         left: bool,
     ) -> ConcreteValue:
         return ConcreteValue(
-            eval_funnel_shift_value(high.value, low.value, amount.value, width, left=left),
+            eval_funnel_shift_value(
+                high.value, low.value, amount.value, width, left=left
+            ),
             width,
         )
 
     def concrete_bool(self, val: ConcreteValue) -> bool | None:
         return bool(val.value)
 
-    def with_width(self, val: ConcreteValue, width: int | None, *, signed: bool = False) -> ConcreteValue:
+    def with_width(
+        self, val: ConcreteValue, width: int | None, *, signed: bool = False
+    ) -> ConcreteValue:
         if signed:
             return ConcreteValue(sext_value(val.value, val.width, width), width)
         return ConcreteValue(mask_value(val.value, width), width)
@@ -102,7 +108,9 @@ class ConcreteMemory(MemoryState[ConcreteValue]):
         data, base = data_from_backing(backing)
         return cls(data, base)
 
-    def read(self, offset: ConcreteValue, width: int, *, insn_addr: int = 0) -> ConcreteValue:
+    def read(
+        self, offset: ConcreteValue, width: int, *, insn_addr: int = 0
+    ) -> ConcreteValue:
         del insn_addr
         byte_width = bytes_for_width(width)
         value = 0
@@ -110,7 +118,14 @@ class ConcreteMemory(MemoryState[ConcreteValue]):
             value |= self._read_byte(offset.value + i) << (i * 8)
         return ConcreteValue(mask_value(value, width), width)
 
-    def write(self, offset: ConcreteValue, value: ConcreteValue, width: int, *, insn_addr: int = 0) -> None:
+    def write(
+        self,
+        offset: ConcreteValue,
+        value: ConcreteValue,
+        width: int,
+        *,
+        insn_addr: int = 0,
+    ) -> None:
         del insn_addr
         byte_width = bytes_for_width(width)
         concrete = mask_value(value.value, width)
@@ -135,7 +150,11 @@ class ConcreteMemory(MemoryState[ConcreteValue]):
 
 
 class ConcreteRegisters(RegisterState[ConcreteValue]):
-    def __init__(self, reg_sizes: dict[str, int], initial: dict[str, int | ConcreteValue] | None = None):
+    def __init__(
+        self,
+        reg_sizes: dict[str, int],
+        initial: dict[str, int | ConcreteValue] | None = None,
+    ):
         self._sizes = reg_sizes
         initial = initial or {}
         self._regs: dict[str, ConcreteValue] = {}
@@ -150,7 +169,9 @@ class ConcreteRegisters(RegisterState[ConcreteValue]):
         return self._regs[name]
 
     def write(self, name: str, value: ConcreteValue) -> None:
-        self._regs[name] = ConcreteValue(mask_value(value.value, self._sizes[name]), self._sizes[name])
+        self._regs[name] = ConcreteValue(
+            mask_value(value.value, self._sizes[name]), self._sizes[name]
+        )
 
     def width(self, name: str) -> int:
         return self._sizes[name]

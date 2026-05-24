@@ -33,11 +33,15 @@ class ValueDomain(Protocol[T]):
         """Evaluate a select (ternary) operation."""
         ...
 
-    def cast(self, op: Opcode, val: T, from_width: int | None, to_width: int | None) -> T:
+    def cast(
+        self, op: Opcode, val: T, from_width: int | None, to_width: int | None
+    ) -> T:
         """Evaluate trunc, zext, or sext."""
         ...
 
-    def funnel_shift(self, high: T, low: T, amount: T, width: int | None, *, left: bool) -> T:
+    def funnel_shift(
+        self, high: T, low: T, amount: T, width: int | None, *, left: bool
+    ) -> T:
         """Evaluate llvm.fshl.* or llvm.fshr.*."""
         ...
 
@@ -71,25 +75,20 @@ class AbstractValueDomain(ValueDomain[T], Protocol[T]):
 class RegisterState(Protocol[T]):
     """Mutable register file indexed by name."""
 
-    def read(self, name: str) -> T:
-        ...
+    def read(self, name: str) -> T: ...
 
-    def write(self, name: str, value: T) -> None:
-        ...
+    def write(self, name: str, value: T) -> None: ...
 
-    def width(self, name: str) -> int:
-        ...
+    def width(self, name: str) -> int: ...
 
 
 @runtime_checkable
 class MemoryState(Protocol[T]):
     """Mutable memory model."""
 
-    def read(self, offset: T, width: int, *, insn_addr: int = 0) -> T:
-        ...
+    def read(self, offset: T, width: int, *, insn_addr: int = 0) -> T: ...
 
-    def write(self, offset: T, value: T, width: int, *, insn_addr: int = 0) -> None:
-        ...
+    def write(self, offset: T, value: T, width: int, *, insn_addr: int = 0) -> None: ...
 
 
 class PtrKind(enum.Enum):
@@ -148,11 +147,9 @@ class StopResult(Generic[T]):
 class InstructionHooks(Protocol[T]):
     """Optional hooks called by the interpreter around instruction execution."""
 
-    def pre_instruction(self, inst: Value) -> None:
-        ...
+    def pre_instruction(self, inst: Value) -> None: ...
 
-    def post_store(self, inst: Value, value: T, ptr: PtrVal[T]) -> T:
-        ...
+    def post_store(self, inst: Value, value: T, ptr: PtrVal[T]) -> T: ...
 
     def post_boundary(
         self,
@@ -161,8 +158,7 @@ class InstructionHooks(Protocol[T]):
         target: T,
         target_arg: Value,
         target_ptr: PtrVal[T] | None,
-    ) -> T:
-        ...
+    ) -> T: ...
 
 
 BINARY_OPS = frozenset(
@@ -204,7 +200,9 @@ class Interpreter(Generic[T]):
         self.hooks = hooks
         self._locals: dict[int, T | PtrVal[T]] = {}
 
-    def execute_block(self, block: BasicBlock) -> int | BoundaryResult[T] | SymbolicBranch[T] | StopResult[T]:
+    def execute_block(
+        self, block: BasicBlock
+    ) -> int | BoundaryResult[T] | SymbolicBranch[T] | StopResult[T]:
         """Execute all instructions in a basic block."""
         self._locals = {}
         for inst in block.instructions:
@@ -241,7 +239,11 @@ class Interpreter(Generic[T]):
             ptr = self.eval_pointer(value.get_operand(0))
             if ptr.kind == PtrKind.STATE and ptr.reg is not None:
                 return self.domain.with_width(self.regs.read(ptr.reg), width)
-            if ptr.kind == PtrKind.MEMORY and ptr.offset is not None and width is not None:
+            if (
+                ptr.kind == PtrKind.MEMORY
+                and ptr.offset is not None
+                and width is not None
+            ):
                 return self.memory.read(
                     self.domain.with_width(ptr.offset, 64),
                     width,
@@ -261,12 +263,20 @@ class Interpreter(Generic[T]):
             return self.domain.cast(op, inner, from_width, width)
         if op == Opcode.ICmp:
             lhs = self.eval_value(value.get_operand(0))
-            rhs = self.domain.with_width(self.eval_value(value.get_operand(1)), value_width(value.get_operand(0)))
-            return self.domain.icmp(value.icmp_predicate, lhs, rhs, value_width(value.get_operand(0)))
+            rhs = self.domain.with_width(
+                self.eval_value(value.get_operand(1)), value_width(value.get_operand(0))
+            )
+            return self.domain.icmp(
+                value.icmp_predicate, lhs, rhs, value_width(value.get_operand(0))
+            )
         if op == Opcode.Select:
             cond = self.domain.with_width(self.eval_value(value.get_operand(0)), 1)
-            true_value = self.domain.with_width(self.eval_value(value.get_operand(1)), width)
-            false_value = self.domain.with_width(self.eval_value(value.get_operand(2)), width)
+            true_value = self.domain.with_width(
+                self.eval_value(value.get_operand(1)), width
+            )
+            false_value = self.domain.with_width(
+                self.eval_value(value.get_operand(2)), width
+            )
             return self.domain.select(cond, true_value, false_value, width)
         if op == Opcode.GetElementPtr:
             ptr = self.eval_pointer(value)
@@ -281,7 +291,9 @@ class Interpreter(Generic[T]):
         if op == Opcode.IntToPtr:
             return self.domain.with_width(self.eval_value(value.get_operand(0)), width)
 
-        return self.domain.unknown(f"unsupported:{op.value}:{str(value).strip()}", width)
+        return self.domain.unknown(
+            f"unsupported:{op.value}:{str(value).strip()}", width
+        )
 
     def eval_pointer(self, value: Value) -> PtrVal[T]:
         """Evaluate an LLVM Value as a state, memory, or unknown pointer."""
@@ -301,9 +313,14 @@ class Interpreter(Generic[T]):
                 return PtrVal(PtrKind.STATE, reg=state_reg)
 
             base_ptr = self.eval_pointer(value.get_operand(0))
-            index = self.domain.with_width(self.eval_value(value.get_operand(value.num_operands - 1)), 64)
+            index = self.domain.with_width(
+                self.eval_value(value.get_operand(value.num_operands - 1)), 64
+            )
             if base_ptr.kind == PtrKind.MEMORY and base_ptr.offset is not None:
-                return PtrVal(PtrKind.MEMORY, self.domain.binary(Opcode.Add, base_ptr.offset, index, 64))
+                return PtrVal(
+                    PtrKind.MEMORY,
+                    self.domain.binary(Opcode.Add, base_ptr.offset, index, 64),
+                )
             return PtrVal(PtrKind.UNKNOWN)
 
         as_value = self.domain.with_width(self.eval_value(value), 64)
@@ -320,7 +337,9 @@ class Interpreter(Generic[T]):
             if self.hooks is not None:
                 value = self.hooks.post_store(inst, value, ptr)
             if ptr.kind == PtrKind.STATE and ptr.reg is not None:
-                self.regs.write(ptr.reg, self.domain.with_width(value, self.regs.width(ptr.reg)))
+                self.regs.write(
+                    ptr.reg, self.domain.with_width(value, self.regs.width(ptr.reg))
+                )
             elif ptr.kind == PtrKind.MEMORY and ptr.offset is not None:
                 width = value_width(inst.get_operand(0))
                 if width is not None:
@@ -349,21 +368,29 @@ class Interpreter(Generic[T]):
             self._locals[hash(inst)] = self.eval_value(inst)
         return None
 
-    def _execute_terminator(self, term: Value) -> int | SymbolicBranch[T] | StopResult[T]:
+    def _execute_terminator(
+        self, term: Value
+    ) -> int | SymbolicBranch[T] | StopResult[T]:
         if term.opcode == Opcode.Br:
             if term.is_conditional:
                 cond = self.domain.with_width(self.eval_value(term.condition), 1)
                 true_target = block_address(term.get_successor(0))
                 false_target = block_address(term.get_successor(1))
                 if true_target is None or false_target is None:
-                    return StopResult("unsupported_branch_target", self.domain.unknown(str(term).strip(), None))
+                    return StopResult(
+                        "unsupported_branch_target",
+                        self.domain.unknown(str(term).strip(), None),
+                    )
                 concrete = self.domain.concrete_bool(cond)
                 if concrete is None:
                     return SymbolicBranch(cond, true_target, false_target)
                 return true_target if concrete else false_target
             target = block_address(term.get_successor(0))
             if target is None:
-                return StopResult("unsupported_branch_target", self.domain.unknown(str(term).strip(), None))
+                return StopResult(
+                    "unsupported_branch_target",
+                    self.domain.unknown(str(term).strip(), None),
+                )
             return target
 
         if term.opcode == Opcode.Ret:
@@ -371,7 +398,10 @@ class Interpreter(Generic[T]):
                 return StopResult("ret", self.eval_value(term.get_operand(0)))
             return StopResult("ret")
 
-        return StopResult(f"unsupported_terminator_{term.opcode.value}", self.domain.unknown(str(term).strip(), None))
+        return StopResult(
+            f"unsupported_terminator_{term.opcode.value}",
+            self.domain.unknown(str(term).strip(), None),
+        )
 
     def _eval_call(self, inst: Value) -> T | BoundaryResult[T]:
         name = call_name(inst)
@@ -380,14 +410,21 @@ class Interpreter(Generic[T]):
             return self.domain.unknown("unknown_call()", width)
         if name.startswith("__striga_undef_"):
             return self.domain.unknown(f"{name}()", width)
-        if name in {"__striga_jmp", "__striga_call", "__striga_ret", "__striga_syscall"}:
+        if name in {
+            "__striga_jmp",
+            "__striga_call",
+            "__striga_ret",
+            "__striga_syscall",
+        }:
             target_arg = inst.get_arg_operand(0)
             target = self.domain.with_width(self.eval_value(target_arg), 64)
             target_ptr = None
             if target_arg.is_instruction and target_arg.opcode == Opcode.Load:
                 target_ptr = self.eval_pointer(target_arg.get_operand(0))
             if self.hooks is not None:
-                target = self.hooks.post_boundary(inst, name, target, target_arg, target_ptr)
+                target = self.hooks.post_boundary(
+                    inst, name, target, target_arg, target_ptr
+                )
             return BoundaryResult(name, target, target_arg, target_ptr)
         if name.startswith("llvm.fshl."):
             return self._eval_funnel_shift(inst, left=True)
@@ -405,7 +442,9 @@ class Interpreter(Generic[T]):
         width = value_width(value)
         high = self.domain.with_width(self.eval_value(value.get_arg_operand(0)), width)
         low = self.domain.with_width(self.eval_value(value.get_arg_operand(1)), width)
-        amount = self.domain.with_width(self.eval_value(value.get_arg_operand(2)), width)
+        amount = self.domain.with_width(
+            self.eval_value(value.get_arg_operand(2)), width
+        )
         return self.domain.funnel_shift(high, low, amount, width, left=left)
 
     def _state_reg_from_gep(self, value: Value) -> str | None:
@@ -434,6 +473,7 @@ class Interpreter(Generic[T]):
 
 
 # Helpers used by both interpreter users and compatibility drivers.
+
 
 def value_width(value: Value) -> int | None:
     return value.type.int_width if value.type.is_integer else None

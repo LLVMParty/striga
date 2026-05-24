@@ -59,7 +59,9 @@ class IntervalDomain(ValueDomain[Interval]):
         del text
         return Interval.full(width or 64)
 
-    def binary(self, op: Opcode, lhs: Interval, rhs: Interval, width: int | None) -> Interval:
+    def binary(
+        self, op: Opcode, lhs: Interval, rhs: Interval, width: int | None
+    ) -> Interval:
         w = width or max(lhs.width, rhs.width, 64)
         if lhs.is_exact and rhs.is_exact:
             return Interval.exact(eval_binary(op, lhs.lo, rhs.lo, w), w)
@@ -73,10 +75,14 @@ class IntervalDomain(ValueDomain[Interval]):
             return Interval(0, min((1 << w) - 1, lhs.lo), w)
         return Interval.full(w)
 
-    def icmp(self, predicate: IntPredicate, lhs: Interval, rhs: Interval, width: int | None) -> Interval:
+    def icmp(
+        self, predicate: IntPredicate, lhs: Interval, rhs: Interval, width: int | None
+    ) -> Interval:
         del width
         if lhs.is_exact and rhs.is_exact:
-            return Interval.exact(int(eval_icmp(predicate, lhs.lo, rhs.lo, lhs.width)), 1)
+            return Interval.exact(
+                int(eval_icmp(predicate, lhs.lo, rhs.lo, lhs.width)), 1
+            )
         name = predicate.name
         if name == "EQ" and (lhs.hi < rhs.lo or rhs.hi < lhs.lo):
             return Interval.exact(0, 1)
@@ -88,13 +94,19 @@ class IntervalDomain(ValueDomain[Interval]):
             return Interval.exact(0, 1)
         return Interval.full(1)
 
-    def select(self, cond: Interval, true_val: Interval, false_val: Interval, width: int | None) -> Interval:
+    def select(
+        self, cond: Interval, true_val: Interval, false_val: Interval, width: int | None
+    ) -> Interval:
         if cond.is_exact:
             return true_val if cond.lo else false_val
         w = width or max(true_val.width, false_val.width, 64)
-        return self._bounded(min(true_val.lo, false_val.lo), max(true_val.hi, false_val.hi), w)
+        return self._bounded(
+            min(true_val.lo, false_val.lo), max(true_val.hi, false_val.hi), w
+        )
 
-    def cast(self, op: Opcode, val: Interval, from_width: int | None, to_width: int | None) -> Interval:
+    def cast(
+        self, op: Opcode, val: Interval, from_width: int | None, to_width: int | None
+    ) -> Interval:
         w = to_width or val.width
         if val.is_exact:
             if op == Opcode.SExt:
@@ -115,7 +127,9 @@ class IntervalDomain(ValueDomain[Interval]):
     ) -> Interval:
         w = width or max(high.width, low.width, amount.width, 64)
         if high.is_exact and low.is_exact and amount.is_exact:
-            return Interval.exact(eval_funnel_shift_value(high.lo, low.lo, amount.lo, w, left=left), w)
+            return Interval.exact(
+                eval_funnel_shift_value(high.lo, low.lo, amount.lo, w, left=left), w
+            )
         return Interval.full(w)
 
     def concrete_bool(self, val: Interval) -> bool | None:
@@ -127,7 +141,9 @@ class IntervalDomain(ValueDomain[Interval]):
             return True
         return None
 
-    def with_width(self, val: Interval, width: int | None, *, signed: bool = False) -> Interval:
+    def with_width(
+        self, val: Interval, width: int | None, *, signed: bool = False
+    ) -> Interval:
         w = width or val.width
         if val.is_exact:
             if signed:
@@ -162,12 +178,16 @@ class IntervalMemory(MemoryState[Interval]):
             return stored
         if self.backing is not None:
             byte_width = width // 8
-            if self.backing.in_range(offset.lo) and self.backing.in_range(offset.lo + byte_width - 1):
+            if self.backing.in_range(offset.lo) and self.backing.in_range(
+                offset.lo + byte_width - 1
+            ):
                 data = self.backing.get_data(offset.lo, byte_width)
                 return Interval.exact(int.from_bytes(data, "little"), width)
         return Interval.full(width)
 
-    def write(self, offset: Interval, value: Interval, width: int, *, insn_addr: int = 0) -> None:
+    def write(
+        self, offset: Interval, value: Interval, width: int, *, insn_addr: int = 0
+    ) -> None:
         del insn_addr
         bytes_for_width(width)
         if offset.is_exact:
@@ -175,13 +195,19 @@ class IntervalMemory(MemoryState[Interval]):
 
 
 class IntervalRegisters(RegisterState[Interval]):
-    def __init__(self, reg_sizes: dict[str, int], initial: dict[str, int | Interval] | None = None):
+    def __init__(
+        self,
+        reg_sizes: dict[str, int],
+        initial: dict[str, int | Interval] | None = None,
+    ):
         self._sizes = reg_sizes
         initial = initial or {}
         self._regs: dict[str, Interval] = {}
         for name, size in reg_sizes.items():
             value = initial.get(name, 0)
-            self._regs[name] = value if isinstance(value, Interval) else Interval.exact(value, size)
+            self._regs[name] = (
+                value if isinstance(value, Interval) else Interval.exact(value, size)
+            )
 
     def read(self, name: str) -> Interval:
         return self._regs[name]

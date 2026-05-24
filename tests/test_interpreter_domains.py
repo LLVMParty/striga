@@ -88,7 +88,9 @@ def test_taint_domain_propagates_register_labels() -> None:
 
 def test_interval_domain_tracks_exact_addition() -> None:
     domain = IntervalDomain()
-    result = domain.binary(Opcode.Add, Interval.exact(10, 64), Interval.exact(32, 64), 64)
+    result = domain.binary(
+        Opcode.Add, Interval.exact(10, 64), Interval.exact(32, 64), 64
+    )
 
     assert result == Interval.exact(42, 64)
     assert domain.concrete_bool(Interval(1, 1, 1)) is True
@@ -151,8 +153,14 @@ def test_smt_domain_builds_register_expression() -> None:
 
 def test_domain_memory_round_trips_sparse_writes() -> None:
     concrete = ConcreteMemory(bytearray(4), base=0x1000)
-    concrete.write(ConcreteDomain().constant(0x800000, 64), ConcreteDomain().constant(0xAABBCCDD, 32), 32)
-    assert concrete.read(ConcreteDomain().constant(0x800000, 64), 32).value == 0xAABBCCDD
+    concrete.write(
+        ConcreteDomain().constant(0x800000, 64),
+        ConcreteDomain().constant(0xAABBCCDD, 32),
+        32,
+    )
+    assert (
+        concrete.read(ConcreteDomain().constant(0x800000, 64), 32).value == 0xAABBCCDD
+    )
 
     taint = TaintMemory(bytearray(4), base=0x1000)
     taint.write(
@@ -160,11 +168,15 @@ def test_domain_memory_round_trips_sparse_writes() -> None:
         Tainted(0x11, 8, frozenset({"value"})),
         8,
     )
-    assert taint.read(Tainted(0x800000, 64, frozenset()), 8).labels == frozenset({"addr", "value"})
+    assert taint.read(Tainted(0x800000, 64, frozenset()), 8).labels == frozenset(
+        {"addr", "value"}
+    )
 
     interval_mem = IntervalMemory()
     interval_mem.write(Interval.exact(0x2000, 64), Interval.exact(0x1234, 16), 16)
-    assert interval_mem.read(Interval.exact(0x2000, 64), 16) == Interval.exact(0x1234, 16)
+    assert interval_mem.read(Interval.exact(0x2000, 64), 16) == Interval.exact(
+        0x1234, 16
+    )
 
     counted_mem = CountingMemory()
     counted_mem.write(Counted.const(0x3000, 64), Counted.const(0x55, 8), 8)
@@ -186,8 +198,19 @@ def test_concrete_boundary_result_uses_domain_value() -> None:
 
             regs = ConcreteRegisters(sem.reg_sizes, {"rsp": 0x2000})
             mem = ConcreteMemory(bytearray())
-            mem.write(ConcreteDomain().constant(0x2000, 64), ConcreteDomain().constant(0x12345678, 64), 64)
-            interp = Interpreter(ConcreteDomain(), regs, mem, sem.reg_sizes, sem.state_ty, sem.reg_indices)
+            mem.write(
+                ConcreteDomain().constant(0x2000, 64),
+                ConcreteDomain().constant(0x12345678, 64),
+                64,
+            )
+            interp = Interpreter(
+                ConcreteDomain(),
+                regs,
+                mem,
+                sem.reg_sizes,
+                sem.state_ty,
+                sem.reg_indices,
+            )
 
             result = interp.execute_block(sem.insn_blocks[0x1000])
 
@@ -198,7 +221,7 @@ def test_concrete_boundary_result_uses_domain_value() -> None:
 
 
 def test_stop_result_import_is_public() -> None:
-    from tools.domains.concrete import ConcreteDomain as ToolConcreteDomain
+    from striga.domains.concrete import ConcreteDomain as ToolConcreteDomain
 
     assert StopResult("ret").reason == "ret"
     assert ToolConcreteDomain is ConcreteDomain
