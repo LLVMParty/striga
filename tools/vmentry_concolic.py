@@ -17,7 +17,19 @@ from capstone.x86_const import X86_REG_RIP
 from llvm import IntPredicate, Opcode, Value, create_context
 
 from container import PEContainer
-from striga import BoundaryResult, Interpreter, PtrKind, PtrVal, Semantics, StopResult, SymbolicBranch
+from striga import (
+    BoundaryResult,
+    InstructionHooks,
+    Interpreter,
+    MemoryState,
+    PtrKind,
+    PtrVal,
+    RegisterState,
+    Semantics,
+    StopResult,
+    SymbolicBranch,
+    ValueDomain,
+)
 from striga.interpreter import instruction_address_from_metadata
 
 
@@ -148,7 +160,7 @@ class MemoryKey:
 
 
 @dataclass
-class MemoryModel:
+class MemoryModel(MemoryState[SymVal]):
     container: PEContainer
     seeds: list[Seed]
     zero_unknown_abs: bool = False
@@ -447,7 +459,7 @@ def annotate_value_with_instruction_seed(
     return value
 
 
-class ProvenanceDomain:
+class ProvenanceDomain(ValueDomain[SymVal]):
     def constant(self, value: int, width: int | None) -> SymVal:
         return SymVal.const(value, width)
 
@@ -529,7 +541,7 @@ class ProvenanceDomain:
         return val.with_width(width, signed=signed)
 
 
-class ProvenanceRegisters:
+class ProvenanceRegisters(RegisterState[SymVal]):
     def __init__(self, regs: dict[str, SymVal], reg_sizes: dict[str, int]):
         self._regs = regs
         self._sizes = reg_sizes
@@ -544,7 +556,7 @@ class ProvenanceRegisters:
         return self._sizes[name]
 
 
-class ProvenanceHooks:
+class ProvenanceHooks(InstructionHooks[SymVal]):
     def __init__(self, seeds: list[Seed], domain: ProvenanceDomain):
         self.seeds = seeds
         self.domain = domain
