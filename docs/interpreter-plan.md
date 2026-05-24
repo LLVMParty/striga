@@ -142,6 +142,23 @@ class ValueDomain(Protocol[T]):
         """Resize a domain value (trunc/zext/sext to target width)."""
         ...
 
+    # --- Abstract interpretation support (future work) ---
+    # These methods are required for multi-path fixed-point analysis but not
+    # for single-trace execution. Current domains should raise NotImplementedError.
+    # See section 11 for design context and planned use cases.
+
+    def join(self, a: T, b: T) -> T:
+        """Least upper bound of two abstract values at a control-flow merge."""
+        raise NotImplementedError
+
+    def bottom(self, width: int | None) -> T:
+        """Least element representing unreachable / no information yet."""
+        raise NotImplementedError
+
+    def is_leq(self, a: T, b: T) -> bool:
+        """Partial order: is `a` already approximated by `b`? Used for fixed-point detection."""
+        raise NotImplementedError
+
 
 @runtime_checkable
 class RegisterState(Protocol[T]):
@@ -1389,4 +1406,120 @@ tools/
 2. **Bool vs BV in the SMT domain.** The SMT domain uses `T = smt.BVTerm | smt.BoolTerm` as a union. The `with_width` and `concrete_bool` methods handle the boundary between the two types.
 
 3. **Symbolic memory addresses.** Out of scope. Both the provenance `MemoryModel` and the SMT `SmtMemory` return unknown for symbolic addresses. Array theory support in the SMT wire protocol is a future extension.
+
+---
+
+## 11. Future Work: Full Abstract Interpretation
+
+This section describes the design changes needed to support multi-path fixed-point analysis over the interpreter. None of this is in scope for the current implementation. It is documented here so that the protocol additions (`join`, `bottom`, `is_leq`) have clear design context and so that a future implementer does not need to rediscover the constraints.
+
+### 11.1. What single-trace execution cannot answer
+
+The current interpreter follows one concrete path. Every domain is driven by `concrete_bool` picking a branch direction, and execution stops when the branch condition is not concretely determined. This is correct for VM-entry bootstrap (one entry RIP, one seed, one path) and for handler stepping where register inputs are known.
+
+There are questions that require analyzing all paths through a piece of code simultaneously:
+
+- What is the full set of handlers reachable from a dispatcher, across all opcode values?
+- What is the maximum virtual stack depth a handler can produce, across all inputs?
+- Which VM registers does a handler read and write on every path, not just the concrete path taken?
+- Is a simplified handler replacement correct for every possible VM state, not just one sample input?
+- Which handler table entries are unreachable under any valid bytecode input?
+
+These require the analysis to follow both sides of a branch, combine results at merge points, and iterate through loops until the abstract state stabilizes.
+
+### 11.2. The abstract interpretation execution model
+
+Classical abstract interpretation replaces the single-trace driver with a worklist fixed-point solver. The driver maintains a map from block address to the current abstract state at that block's entry. When a block is analyzed, its output state is propagated to successor blocks. If a successor already has a state, the old and new states are joined (least upper bound). If the join produces a strictly wider state than what was there before, the successor is re-added to the worklist. The analysis terminates when no block's state grows — the fixed point.
+
+```
+initialize:
+    block_states[entry] = initial_state
+    worklist = [entry]
+
+iterate:
+    while worklist is not empty:
+        rip = worklist.pop()
+        input_state = block_states[rip]
+        output_state, successor = interpreter.execute_block(block, input_state)
+
+        for each target in successors(successor):
+            existing = block_states.get(target)
+            if existing is None:
+                block_states[target] = output_state
+                worklist.add(target)
+            else:
+                joined = domain.join(existing, output_state)  -- per register
+                if not domain.is_leq(joined, existing):       -- per register
+                    block_states[target] = joined
+                    worklist.add(target)
+```
+
+### 11.3. Required interpreter changes
+
+The current interpreter mutates register and memory state in place. The fixed-point driver needs to run a block with a given input state and get an output state without destroying the input, because the input may be needed again if the block is re-analyzed after a join widens its incoming state.
+
+Two options:
+
+1. Make `RegisterState` and `MemoryState` support cheap copying (snapshot before execution, keep original intact). The interpreter stays mostly unchanged but the driver copies state before each `execute_block` call.
+
+2. Make the interpreter functionally pure: `execute_block` takes an immutable state and returns a new state. This is cleaner but requires more pervasive changes to the interpreter internals.
+
+Option 1 is lower-risk and preserves compatibility with the single-trace driver.
+
+### 11.4. SymbolicBranch semantics change
+
+In the single-trace driver, `SymbolicBranch` means "stop." In the fixed-point driver, it means "fork — propagate the current state to both successors." The `SymbolicBranch` result type would need to carry both successor addresses:
+
+```python
+@dataclass(frozen=True)
+class SymbolicBranch(Generic[T]):
+    condition: T
+    true_target: int
+    false_target: int
+```
+
+This is backward-compatible: the single-trace driver ignores the target fields and stops. The fixed-point driver uses them to propagate.
+
+### 11.5. Widening for loops
+
+Without widening, a loop that increments a value causes the interval domain to iterate forever: `[0,0]` → `[0,1]` → `[0,2]` → ... Widening is an operator that jumps to a safe overapproximation after a threshold, guaranteeing termination at the cost of precision.
+
+For intervals, widening is: if the new lower bound decreased, jump to 0; if the new upper bound increased, jump to the type maximum. One iteration of widening reaches the fixed point for any monotone loop.
+
+Widening is deliberately not included in the current `ValueDomain` protocol. Its design is heavily domain-specific (intervals widen differently from taint sets, SMT terms need a different strategy entirely), and there is no sensible default. When the fixed-point driver is built, `widen` should be added to the protocol alongside a policy for identifying loop headers (back-edge targets in the lifted CFG).
+
+### 11.6. Memory join
+
+Register state is finite and fixed — joining is per-register. Memory is the hard problem. The current `MemoryState` is an open-ended dictionary from addresses to values. Joining two memory states means joining every address that either state has written to, and the address sets can differ between paths.
+
+For VM analysis specifically, a practical approach is to partition memory into named finite regions: virtual stack slots, VM context fields, handler table entries. Each region has a fixed set of offsets with known widths. Joining is then per-slot within each region, identical to register joining. Accesses outside known regions return `bottom` or `unknown`.
+
+This requires domain-specific knowledge of the VM layout, which makes it unsuitable for a fully generic `MemoryState` protocol. The likely implementation is a `PartitionedMemory` that takes a VM layout descriptor and implements `MemoryState` with finite joinable regions.
+
+### 11.7. Which domains benefit
+
+Not all domains are useful in a multi-path setting:
+
+| Domain | Multi-path viable | Join behavior |
+|---|---|---|
+| Concrete (`int`) | No | No useful join — different values become "unknown" |
+| Provenance (`SymVal`) | No | Expression text and concrete values cannot be meaningfully merged |
+| Taint (`Tainted`) | Yes | Join is label set union; concrete value is lost but taint propagation remains sound |
+| Interval | Yes | Join is enclosing interval; this is the classical use case for abstract interpretation |
+| SMT | Theoretically | Join is disjunction (`ite`); expressions grow exponentially without simplification |
+| Counting | No | Cost metrics are path-specific; joining counts from different paths is not meaningful |
+
+The practical multi-path domains are intervals and taint. The SMT domain can work but needs aggressive expression simplification at join points to avoid blowup.
+
+### 11.8. Use cases for VM analysis
+
+**Handler dispatch coverage.** The VM dispatcher reads an opcode byte, indexes a table, and jumps to a handler. With the interval domain, the opcode index enters as `Interval(0, 255)`. The dispatcher's comparison cascade or table lookup produces interval-valued targets. At the boundary, the target interval spans all reachable handler addresses. This recovers the full handler table in one analysis pass instead of 256 concrete sweeps. For multi-byte dispatch keys or multi-level dispatch tables, the advantage grows.
+
+**Virtual stack depth bounds.** VM handlers push and pop from a virtual stack modeled as a pointer offset. An interval analysis tracks the stack pointer's range across all paths through a handler or handler sequence. The resulting interval gives the maximum stack depth, which is needed for allocating concrete stack space during recompilation and for detecting potential stack overflow in the VM program.
+
+**Dead register analysis.** A taint analysis over all paths determines which VM registers a handler reads on any path (tainted by the register's input label) and which it writes on every path (output always has taint from the handler's computation, never from the input label). Registers written on every path are dead-on-entry for successor handlers. This is the liveness information needed for register allocation during recompilation.
+
+**Handler equivalence under all inputs.** When replacing an obfuscated handler with a simplified implementation, verification against a single concrete input is insufficient. An SMT domain with multi-path analysis builds symbolic expressions that cover all paths through both the original and replacement handlers. Asserting that the outputs differ and getting UNSAT proves equivalence for all inputs, not just the tested ones.
+
+**Unreachable handler detection.** Starting from the entry point with the full range of valid bytecode inputs, an abstract interpretation shows which handlers have `bottom` (unreachable) incoming state. These handlers are never dispatched by any valid bytecode and can be classified as dead code, padding, or anti-analysis traps. This reduces the handler set that subsequent analysis stages need to process.
 
