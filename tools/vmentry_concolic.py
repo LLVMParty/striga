@@ -100,7 +100,7 @@ class SymVal:
     concrete: int | None
     width: int | None
     address: Address | None = None
-    unknowns: tuple[str, ...] = ()
+    unknowns: frozenset[str] = frozenset()
     deps: frozenset[str] = frozenset()
     xor_symbols: frozenset[str] = frozenset()
     xor_address: Address | None = None
@@ -140,7 +140,7 @@ class SymVal:
     @staticmethod
     def unknown(text: str, width: int | None) -> SymVal:
         return SymVal(
-            text, None, width, unknowns=(text,), xor_symbols=frozenset({text})
+            text, None, width, unknowns=frozenset({text}), xor_symbols=frozenset({text})
         )
 
     @staticmethod
@@ -512,7 +512,7 @@ class ProvenanceDomain(ValueDomain[SymVal]):
             f"icmp.{predicate.name.lower()}({lhs.text}, {rhs.text})",
             concrete,
             1,
-            unknowns=(*lhs.unknowns, *rhs.unknowns),
+            unknowns=lhs.unknowns | rhs.unknowns,
             deps=lhs.deps | rhs.deps,
         )
 
@@ -528,7 +528,7 @@ class ProvenanceDomain(ValueDomain[SymVal]):
             f"select({cond.text}, {true_val.text}, {false_val.text})",
             concrete,
             width,
-            unknowns=(*cond.unknowns, *true_val.unknowns, *false_val.unknowns),
+            unknowns=cond.unknowns | true_val.unknowns | false_val.unknowns,
             deps=cond.deps | true_val.deps | false_val.deps,
         )
 
@@ -582,7 +582,7 @@ class ProvenanceDomain(ValueDomain[SymVal]):
             f"{name}({high.text}, {low.text}, {amount.text})",
             concrete,
             width,
-            unknowns=(*high.unknowns, *low.unknowns, *amount.unknowns),
+            unknowns=high.unknowns | low.unknowns | amount.unknowns,
             deps=high.deps | low.deps | amount.deps,
         )
 
@@ -877,7 +877,7 @@ def combine_values(
         concrete,
         width,
         address,
-        (*lhs.unknowns, *rhs.unknowns),
+        lhs.unknowns | rhs.unknowns,
         lhs.deps | rhs.deps,
         xor_address=xor_address,
     )
@@ -920,7 +920,7 @@ def combine_xor(lhs: SymVal, rhs: SymVal, width: int | None) -> SymVal | None:
         concrete,
         width,
         value_address,
-        (*lhs.unknowns, *rhs.unknowns),
+        lhs.unknowns | rhs.unknowns,
         lhs.deps | rhs.deps,
         frozenset(symbols),
         address,
@@ -1030,8 +1030,8 @@ def render_result(result: ConcolicResult) -> str:
         if result.boundary_value is None
         else expression_with_deps(result.boundary_value)
     )
-    unknowns: tuple[str, ...] = (
-        () if result.boundary_value is None else result.boundary_value.unknowns
+    unknowns: frozenset[str] = (
+        frozenset() if result.boundary_value is None else result.boundary_value.unknowns
     )
     lines = [
         "# LLVM concolic VM-entry report",
