@@ -63,6 +63,7 @@ FLAGS = {
     "af": 4,
     "zf": 6,
     "sf": 7,
+    "df": 10,
     "of": 11,
 }
 
@@ -117,12 +118,7 @@ class Semantics:
             **{gpr.r64: 64 for gpr in GPRS},
             "gsbase": 64,
             **{name: 128 for name in XMM_REGS},
-            "cf": 8,
-            "zf": 8,
-            "sf": 8,
-            "of": 8,
-            "pf": 8,
-            "af": 8,
+            **{name: 8 for name in FLAGS},
         }
         self.reg_types = {
             name: types.int_n(size) for name, size in self.reg_sizes.items()

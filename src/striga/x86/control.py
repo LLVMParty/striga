@@ -1,5 +1,5 @@
 from ..semantics import FLAGS, semantic, Semantics, Successor
-from llvm import Value
+from llvm import IntPredicate, Value
 
 
 def bool_not(sem: Semantics, value: Value) -> Value:
@@ -258,6 +258,53 @@ def jcxz(sem: Semantics, reg: str):
     return conditional_jump(sem, sem.result_is_zero(value))
 
 
+def loop_counter_reg(sem: Semantics) -> str:
+    if sem.insn.addr_size == 8:
+        return "rcx"
+    if sem.insn.addr_size == 4:
+        return "ecx"
+    return "cx"
+
+
+def loopcc(sem: Semantics, zf_required: bool | None):
+    reg = loop_counter_reg(sem)
+    count = sem.reg_read(reg)
+    next_count = sem.ir.sub(count, count.type.constant(1))
+    sem.reg_write(reg, next_count)
+    cond = sem.ir.icmp(IntPredicate.NE, next_count, next_count.type.constant(0))
+    if zf_required is not None:
+        zf = sem.flag_read("zf")
+        if not zf_required:
+            zf = bool_not(sem, zf)
+        cond = sem.ir.and_(cond, zf)
+    return conditional_jump(sem, cond)
+
+
+@semantic
+def loop(sem: Semantics):
+    return loopcc(sem, None)
+
+
+@semantic
+def loope(sem: Semantics):
+    return loopcc(sem, True)
+
+
+@semantic
+def loopz(sem: Semantics):
+    return loopcc(sem, True)
+
+
+@semantic
+def loopne(sem: Semantics):
+    return loopcc(sem, False)
+
+
+@semantic
+def loopnz(sem: Semantics):
+    return loopcc(sem, False)
+
+
 @semantic
 def ja(sem: Semantics):
     return jcc(sem, "a")
@@ -411,6 +458,16 @@ def stc(sem: Semantics):
 @semantic
 def cmc(sem: Semantics):
     sem.flag_write("cf", bool_not(sem, sem.flag_read("cf")))
+
+
+@semantic
+def cld(sem: Semantics):
+    sem.flag_write("df", sem.const_n(0, 1))
+
+
+@semantic
+def std(sem: Semantics):
+    sem.flag_write("df", sem.const_n(1, 1))
 
 
 @semantic

@@ -1,6 +1,7 @@
 from capstone import CS_OP_REG
 
 from ..semantics import FLAGS, Semantics, semantic
+from .arithmetic import write_sub_flags
 
 
 @semantic
@@ -173,3 +174,45 @@ def xchg(sem: Semantics):
     dst = sem.op_read(0)
     sem.op_write(0, src)
     sem.op_write(1, dst)
+
+
+def scas_impl(sem: Semantics):
+    acc = sem.op_read(0)
+    src = sem.resize_int(sem.op_read(1), acc.type)
+    result = sem.ir.sub(acc, src)
+    write_sub_flags(sem, acc, src, result)
+
+    if sem.insn.addr_size == 8:
+        index_reg = "rdi"
+    elif sem.insn.addr_size == 4:
+        index_reg = "edi"
+    else:
+        index_reg = "di"
+    index = sem.reg_read(index_reg)
+    delta = index.type.constant(acc.type.int_width // 8)
+    next_index = sem.ir.select(
+        sem.flag_read("df"),
+        sem.ir.sub(index, delta),
+        sem.ir.add(index, delta),
+    )
+    sem.reg_write(index_reg, next_index)
+
+
+@semantic
+def scasb(sem: Semantics):
+    scas_impl(sem)
+
+
+@semantic
+def scasw(sem: Semantics):
+    scas_impl(sem)
+
+
+@semantic
+def scasd(sem: Semantics):
+    scas_impl(sem)
+
+
+@semantic
+def scasq(sem: Semantics):
+    scas_impl(sem)

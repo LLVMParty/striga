@@ -773,6 +773,8 @@ class LLVMConcolicExecutor:
                 regs[name] = SymVal.env("stack", width)
             elif name == "gsbase":
                 regs[name] = SymVal.env("teb", width)
+            elif name == "df":
+                regs[name] = SymVal.const(0, width)
             else:
                 regs[name] = SymVal.unknown(f"source_{name}()", width)
         seeds: list[Seed] = []
