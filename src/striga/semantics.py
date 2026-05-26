@@ -151,6 +151,7 @@ class Semantics:
         self.call_handler = self.module.add_function("__striga_call", helper_ty)
         self.ret_handler = self.module.add_function("__striga_ret", helper_ty)
         self.syscall_handler = self.module.add_function("__striga_syscall", helper_ty)
+        self.invalid_handler = self.module.add_function("__striga_invalid", helper_ty)
 
         def add_undef_flag(name: str) -> Function:
             helper = self.module.add_function(f"__striga_undef_{name}", undef_flag_ty)
@@ -284,11 +285,31 @@ class Semantics:
             self.module.verify_or_raise()
             return successors
 
+    def lift_invalid(self, address: int) -> list[Successor]:
+        """Lift an invalid instruction trap at ``address``."""
+        if not hasattr(self, "function"):
+            self.begin(address)
+        block = self.get_or_create_block(address)
+        assert block.first_instruction
+        if block.first_instruction.opcode == Opcode.Ret:
+            block.first_instruction.erase_from_parent()
+        else:
+            return []
+        with block.create_builder() as ir:
+            ir.call(self.invalid_handler, [self.const64(address)])
+            ir.ret_void()
+        self.module.verify_or_raise()
+        return []
+
     def lift_bytes(self, address: int, code: bytes) -> list[Successor]:
         """Disassemble and lift a single instruction. Convenience wrapper."""
         if not hasattr(self, "function"):
             self.begin(address)
-        return self.lift_instruction(self.cs_disasm(address, code))
+        try:
+            insn = self.cs_disasm(address, code)
+        except ValueError:
+            return self.lift_invalid(address)
+        return self.lift_instruction(insn)
 
     def reg_name(self, reg_id: int) -> str:
         return self.insn.reg_name(reg_id)  # pyright: ignore[reportReturnType]

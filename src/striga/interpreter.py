@@ -415,6 +415,7 @@ class Interpreter(Generic[T]):
             "__striga_call",
             "__striga_ret",
             "__striga_syscall",
+            "__striga_invalid",
         }:
             target_arg = inst.get_arg_operand(0)
             target = self.domain.with_width(self.eval_value(target_arg), 64)
