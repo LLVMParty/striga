@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from capstone import CS_GRP_CALL, CS_GRP_JUMP, CS_OP_IMM, CS_OP_MEM, CsInsn
+from capstone import CS_GRP_JUMP, CS_OP_IMM, CS_OP_MEM
 from capstone.x86_const import X86_REG_RIP
 from llvm import IntPredicate, Opcode, Value, create_context
 
@@ -707,26 +707,40 @@ class LLVMConcolicExecutor:
                 for step in range(self.cfg.max_steps):
                     state.steps = step + 1
                     code = self.container.get_data(rip, 15)
-                    insn = sem.cs_disasm(rip, code)
-                    instruction = f"{insn.mnemonic} {insn.op_str}".strip()
-                    self._record_seed_candidates(insn, state)
+                    try:
+                        insn = sem.cs_disasm(rip, code)
+                    except ValueError:
+                        insn = None
+                        instruction = f"invalid {code[0]:#04x}"
+                    else:
+                        instruction = f"{insn.mnemonic} {insn.op_str}".strip()
+                        self._record_seed_candidates(insn, state)
                     if len(self.trace) < self.cfg.trace_limit:
                         self.trace.append(f"{rip:#x}: {instruction}")
 
-                    if insn.group(CS_GRP_CALL) and rip in self.cfg.follow_calls:
-                        self._lift_followed_call(sem, insn)
-                    else:
-                        block = sem.get_or_create_block(rip)
-                        if (
-                            block.first_instruction is not None
-                            and block.first_instruction.opcode == Opcode.Ret
-                        ):
+                    block = sem.get_or_create_block(rip)
+                    if (
+                        block.first_instruction is not None
+                        and block.first_instruction.opcode == Opcode.Ret
+                    ):
+                        if insn is None:
+                            sem.lift_invalid(rip)
+                        else:
                             sem.lift_instruction(insn)
 
                     block = sem.insn_blocks[rip]
                     block_result = interp.execute_block(block)
                     if isinstance(block_result, BoundaryResult):
                         boundary = cast("BoundaryResult[SymVal]", block_result)
+                        if boundary.name == "__striga_call" and rip in self.cfg.follow_calls:
+                            target = boundary.target.concrete
+                            if target is not None:
+                                if len(self.trace) < self.cfg.trace_limit:
+                                    self.trace.append(
+                                        f"{rip:#x}: follow __striga_call -> {target:#x}"
+                                    )
+                                rip = target
+                                continue
                         state.boundary_call = boundary.name
                         state.boundary_value = boundary.target
                         stop = rip
@@ -819,24 +833,6 @@ class LLVMConcolicExecutor:
                     state.seeds,
                     Seed("lea_addr", insn.address, addr, f"lea {insn.op_str}"),
                 )
-
-    def _lift_followed_call(self, sem: Semantics, insn: CsInsn) -> None:
-        block = sem.get_or_create_block(insn.address)
-        if (
-            block.first_instruction is not None
-            and block.first_instruction.opcode == Opcode.Ret
-        ):
-            block.first_instruction.erase_from_parent()
-        else:
-            return
-        target = insn.operands[0].imm
-        fallthrough = insn.address + insn.size
-        with block.create_builder() as ir:
-            sem.ir = ir
-            sem.insn = insn
-            sem.push(sem.const64(fallthrough))
-            ir.br(sem.get_or_create_block(target))
-        sem.module.verify_or_raise()
 
     def _write_outputs(self, result: ConcolicResult) -> None:
         self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
