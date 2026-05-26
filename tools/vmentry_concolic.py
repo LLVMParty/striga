@@ -105,6 +105,8 @@ class SymVal:
     xor_symbols: frozenset[str] = frozenset()
     xor_address: Address | None = None
     xor_const: int = 0
+    offset_base: SymVal | None = None
+    offset_const: int = 0
 
     def with_width(self, width: int | None, *, signed: bool = False) -> SymVal:
         if width is None or self.width == width:
@@ -117,9 +119,12 @@ class SymVal:
                 else mask_value(self.concrete, width)
             )
         address = self.address if width == 64 and self.width == 64 else None
-        xor_address = self.xor_address if width == self.width else None
-        xor_symbols = self.xor_symbols if width == self.width else frozenset()
-        xor_const = self.xor_const if width == self.width else 0
+        same_width = width == self.width
+        xor_address = self.xor_address if same_width else None
+        xor_symbols = self.xor_symbols if same_width else frozenset()
+        xor_const = self.xor_const if same_width else 0
+        offset_base = self.offset_base if same_width else None
+        offset_const = self.offset_const if same_width else 0
         return SymVal(
             f"{cast_text('sext' if signed else 'zext', self.text, width)}",
             concrete,
@@ -130,6 +135,8 @@ class SymVal:
             xor_symbols,
             xor_address,
             xor_const,
+            offset_base,
+            offset_const,
         )
 
     @staticmethod
@@ -488,6 +495,8 @@ def annotate_value_with_instruction_seed(
             value.xor_symbols,
             value.xor_address,
             value.xor_const,
+            value.offset_base,
+            value.offset_const,
         )
     return value
 
@@ -673,6 +682,8 @@ class ProvenanceHooks(InstructionHooks[SymVal]):
             target.xor_symbols,
             target.xor_address,
             target.xor_const,
+            target.offset_base,
+            target.offset_const,
         )
 
 
@@ -861,6 +872,10 @@ def combine_address(lhs: SymVal, rhs: SymVal, opcode: Opcode) -> Address | None:
 def combine_values(
     lhs: SymVal, rhs: SymVal, opcode: Opcode, width: int | None
 ) -> SymVal:
+    if opcode in {Opcode.Add, Opcode.Sub}:
+        simplified = combine_add_sub_offset(lhs, rhs, opcode, width)
+        if simplified is not None:
+            return simplified
     if opcode == Opcode.Xor:
         simplified = combine_xor(lhs, rhs, width)
         if simplified is not None:
@@ -878,6 +893,86 @@ def combine_values(
         lhs.unknowns | rhs.unknowns,
         lhs.deps | rhs.deps,
         xor_address=xor_address,
+    )
+
+
+def combine_add_sub_offset(
+    lhs: SymVal, rhs: SymVal, opcode: Opcode, width: int | None
+) -> SymVal | None:
+    if width is None:
+        return None
+    if rhs.concrete is not None:
+        base, current = offset_components(lhs)
+        delta = sign_extend(rhs.concrete, rhs.width)
+        if opcode == Opcode.Sub:
+            delta = -delta
+        return make_offset_value(
+            base,
+            current + delta,
+            width,
+            lhs.deps | rhs.deps,
+            f"({lhs.text} {opcode_symbol(opcode)} {rhs.text})",
+        )
+    if opcode == Opcode.Add and lhs.concrete is not None:
+        base, current = offset_components(rhs)
+        delta = sign_extend(lhs.concrete, lhs.width)
+        return make_offset_value(
+            base,
+            current + delta,
+            width,
+            lhs.deps | rhs.deps,
+            f"({lhs.text} + {rhs.text})",
+        )
+    return None
+
+
+def offset_components(value: SymVal) -> tuple[SymVal, int]:
+    base = value
+    total = 0
+    seen: set[int] = set()
+    while base.offset_base is not None and id(base) not in seen:
+        seen.add(id(base))
+        total += base.offset_const
+        base = base.offset_base
+    return base, total
+
+
+def make_offset_value(
+    base: SymVal,
+    delta: int,
+    width: int,
+    deps: frozenset[str],
+    fallback_text: str,
+) -> SymVal:
+    delta = sign_extend(mask_value(delta, width), width)
+    if delta == 0:
+        return base.with_width(width)
+    concrete = None
+    if base.concrete is not None:
+        concrete = mask_value(base.concrete + delta, width)
+    if width == 64 and base.address is not None:
+        address = base.address.add(delta)
+        return SymVal(
+            address.text(),
+            concrete,
+            width,
+            address,
+            base.unknowns,
+            base.deps | deps,
+            xor_address=address,
+        )
+    op = "+" if delta >= 0 else "-"
+    text = f"({base.text} {op} {format_int(abs(delta))})"
+    if text == fallback_text:
+        text = fallback_text
+    return SymVal(
+        text,
+        concrete,
+        width,
+        unknowns=base.unknowns,
+        deps=base.deps | deps,
+        offset_base=base,
+        offset_const=delta,
     )
 
 
