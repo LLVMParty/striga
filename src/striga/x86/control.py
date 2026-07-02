@@ -404,6 +404,16 @@ def clc(sem: Semantics):
 
 
 @semantic
+def std(sem: Semantics):
+    sem.flag_write("df", sem.i1.constant(1))
+
+
+@semantic
+def cld(sem: Semantics):
+    sem.flag_write("df", sem.i1.constant(0))
+
+
+@semantic
 def int_(sem: Semantics):
     sem.ir.ret_void()
     return []

@@ -63,6 +63,7 @@ FLAGS = {
     "af": 4,
     "zf": 6,
     "sf": 7,
+    "df": 10,
     "of": 11,
 }
 
@@ -123,6 +124,7 @@ class Semantics:
             "of": 8,
             "pf": 8,
             "af": 8,
+            "df": 8,
         }
         self.reg_types = {
             name: types.int_n(size) for name, size in self.reg_sizes.items()
